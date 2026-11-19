@@ -1,0 +1,158 @@
+# A release's files, built here from the tag and put on its GitHub release:
+# the Windows installer (Kiri-<v>-x86_64.msi and its update feed) and the
+# eight Linux packages with SHA256SUMS-linux. The version line in Cargo.toml
+# is set from the tag, as RELEASES.md describes; nothing else changes.
+# A release/* or hotfix/* branch is built the same way, as a check before
+# its finish, and its files stay workflow artifacts. The Mac's app needs
+# Apple's signing and is not built here.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["release/*", "hotfix/*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag (or, to try the build, a branch) to build, e.g. v0.3.1"
+        required: true
+      publish:
+        description: "Put the files on the tag's GitHub release (off: workflow artifacts only)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/') || inputs.publish == true }}
+  GH_TOKEN: ${{ github.token }}
+  CARGO_TERM_COLOR: never
+
+jobs:
+  release:
+    name: GitHub release
+    if: ${{ startsWith(github.ref, 'refs/tags/') || inputs.publish == true }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Create the release, with the version's notes, if it isn't there
+        run: |
+          v=${TAG#v}
+          gh release view "$TAG" >/dev/null 2>&1 && exit 0
+          notes=docs/releases/$v.md
+          [ -f "$notes" ] || notes=/dev/null
+          gh release create "$TAG" --title "Kiri $v" --notes-file "$notes" --verify-tag
+
+  engine:
+    name: Linux half of the Windows bundle (x86-64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Version from the tag
+        run: |
+          v=${TAG##*/}
+          v=${v#v}
+          case "$v" in [0-9]*.[0-9]*.[0-9]*) ;; *) v=0.0.0-dev.$GITHUB_RUN_NUMBER ;; esac
+          sed -i "0,/^version = \"0.0.0\"/s//version = \"$v\"/" Cargo.toml && grep -m1 '^version' Cargo.toml
+      - run: rustup update stable --no-self-update && rustup default stable
+      - name: Engine (static musl)
+        run: bash scripts/windows-engine.sh "$PWD" target/linux-x86_64-musl x86_64 release
+      - name: Kiri Linux, the WSL distro
+        run: sh scripts/kiri-linux.sh "$PWD" target/linux-x86_64-musl target/linux-x86_64-musl/kiri-linux.tar.gz x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-musl
+          path: |
+            target/linux-x86_64-musl/kiri
+            target/linux-x86_64-musl/kiri-init
+            target/linux-x86_64-musl/kiri-linux.tar.gz
+          if-no-files-found: error
+
+  msi:
+    name: Windows installer (x86-64)
+    needs: [release, engine]
+    if: ${{ always() && needs.engine.result == 'success' && needs.release.result != 'failure' }}
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Version from the tag
+        run: |
+          v=${TAG##*/}
+          v=${v#v}
+          case "$v" in [0-9]*.[0-9]*.[0-9]*) ;; *) v=0.0.0-dev.$GITHUB_RUN_NUMBER ;; esac
+          sed -i "0,/^version = \"0.0.0\"/s//version = \"$v\"/" Cargo.toml && grep -m1 '^version' Cargo.toml
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64-musl
+          path: target/linux-x86_64-musl
+      - run: rustup update stable --no-self-update && rustup default stable
+      - name: WiX 5
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          echo "$USERPROFILE/.dotnet/tools" >> "$GITHUB_PATH"
+          "$USERPROFILE/.dotnet/tools/wix" extension add -g WixToolset.UI.wixext/5.0.2
+          "$USERPROFILE/.dotnet/tools/wix" extension add -g WixToolset.Util.wixext/5.0.2
+      - name: Bundle and MSI
+        env:
+          KIRI_LINUX_PREBUILT: "1"
+          KIRI_RELEASE_BASE: https://github.com/${{ github.repository }}/releases/download/${{ env.TAG }}
+        run: cargo xtask msi
+      - name: Checksum
+        run: |
+          cd target
+          sha256sum Kiri-*-x86_64.msi > SHA256SUMS-windows
+          ls -l Kiri-*-x86_64.msi
+          cat SHA256SUMS-windows latest-windows-x86_64.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            target/Kiri-*-x86_64.msi
+            target/latest-windows-x86_64.json
+            target/SHA256SUMS-windows
+          if-no-files-found: error
+      - name: Upload to the release
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          cd target
+          msi=$(ls Kiri-*-x86_64.msi)
+          gh release upload "$TAG" "$msi" latest-windows-x86_64.json SHA256SUMS-windows --clobber -R "$GITHUB_REPOSITORY"
+
+  linux:
+    name: Linux packages
+    needs: release
+    if: ${{ always() && needs.release.result != 'failure' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Version from the tag
+        run: |
+          v=${TAG##*/}
+          v=${v#v}
+          case "$v" in [0-9]*.[0-9]*.[0-9]*) ;; *) v=0.0.0-dev.$GITHUB_RUN_NUMBER ;; esac
+          sed -i "0,/^version = \"0.0.0\"/s//version = \"$v\"/" Cargo.toml && grep -m1 '^version' Cargo.toml
+      - run: rustup update stable --no-self-update && rustup default stable
+      - name: Build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends python3-venv rpm pkg-config libwebkit2gtk-4.1-dev
+      - run: sh scripts/ci/linux-build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: target/packages/
+          if-no-files-found: error
+      - name: Upload to the release
+        if: ${{ env.PUBLISH == 'true' }}
+        run: gh release upload "$TAG" target/packages/*.deb target/packages/*.rpm target/packages/SHA256SUMS-linux --clobber
