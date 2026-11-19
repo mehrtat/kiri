@@ -1650,6 +1650,14 @@ fn child_fds(p: &Prepared, io: &ChildStdio) -> Vec<RawFd> {
     fds
 }
 
+/// The descriptors an exec's child still uses of those it inherited: a
+/// container child's (`child_fds`) and the namespaces it joins.
+fn exec_fds(p: &Prepared, namespaces: &[(fs::File, libc::c_int)], io: &ChildStdio) -> Vec<RawFd> {
+    let mut fds = child_fds(p, io);
+    fds.extend(namespaces.iter().map(|(f, _)| f.as_raw_fd()));
+    fds
+}
+
 /// Runs in the cloned child: PID 1 of the container, in its own namespaces
 /// and cgroup. Never returns: it execs or exits 127 with a message.
 fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
@@ -1735,6 +1743,13 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
 /// Runs in the cloned child of an exec: joins the container's remaining
 /// namespaces (the PID namespace was set before clone), then execs.
 fn exec_child(p: &Prepared, namespaces: &[(fs::File, libc::c_int)], io: &ChildStdio) -> ! {
+    // As a container's child does (container_child): the clone gave this
+    // child every descriptor the agent had, and close-on-exec drops them only
+    // at execve. An exec that never got there (a healthcheck's, on a gate PC)
+    // kept a network's DNS socket bound after the network was removed, and
+    // every start on the next network with that subnet failed with
+    // "dns bind: Address in use".
+    sys::close_now(&sys::close_ranges(&exec_fds(p, namespaces, io)));
     let err = report_fd(io);
     for (fd, kind) in namespaces {
         sys::setns(fd.as_raw_fd(), *kind).unwrap_or_else(|e| child_fail(err, "join container", e));
@@ -2258,6 +2273,32 @@ mod tests {
         let tty = ChildStdio::Tty { sock };
         assert_eq!(sorted(child_fds(&p, &tty)), sorted([streams(&tty), theirs.to_vec()].concat()));
         drop((w0, r1, r2, go, root_r));
+    }
+
+    /// An exec's child closes every inherited descriptor but its streams and
+    /// the namespaces it joins (see `exec_fds`): a DNS socket, or any other
+    /// of the agent's, is not among them.
+    #[test]
+    fn an_exec_child_keeps_only_its_streams_and_namespaces() {
+        use super::{ChildStdio, exec_fds, sys};
+        use std::os::fd::AsRawFd;
+        let mut buf = Vec::new();
+        let net = Net { bridge: "kiri1", ip: [10, 5, 0, 2], prefix: 24, gateway: [10, 5, 0, 1], extra_hosts: &[], dns_names: &[], opts: &[] };
+        encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", 0, net, &[], &Limits::default(), 0, &[] as &[&str], &[]);
+        let Ok(Msg::Run(spec)) = decode(&buf) else { panic!() };
+        let p = super::prepare(spec.argv, spec.env, spec.cwd, spec.user, None, spec.flags, spec.caps).unwrap();
+        let (_r1, w1) = sys::pipe().unwrap();
+        let (_r2, w2) = sys::pipe().unwrap();
+        let io = ChildStdio::Pipes { stdin: None, stdout: w1, stderr: w2 };
+        let ns = vec![(std::fs::File::open("/dev/null").unwrap(), libc::CLONE_NEWNET), (std::fs::File::open("/dev/null").unwrap(), libc::CLONE_NEWNS)];
+        let agents = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let ChildStdio::Pipes { stdout, stderr, .. } = &io else { unreachable!() };
+        let mut want = vec![stdout.as_raw_fd(), stderr.as_raw_fd(), ns[0].0.as_raw_fd(), ns[1].0.as_raw_fd()];
+        want.sort_unstable();
+        let mut got = exec_fds(&p, &ns, &io);
+        got.sort_unstable();
+        assert_eq!(got, want);
+        assert!(!got.contains(&agents.as_raw_fd()));
     }
 
     #[test]
