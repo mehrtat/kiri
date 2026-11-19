@@ -162,9 +162,97 @@ fn install_nat(nat: Nat) -> io::Result<()> {
         }
     };
     if r.is_ok() {
+        // A Linux host: its own firewall may drop what Kiri's table lets through.
+        if !nat.redirect {
+            open_host_forward();
+        }
         *NAT.lock().unwrap_or_else(|e| e.into_inner()) = Some(nat);
     }
     r
+}
+
+/// The iptables tools for IPv4 and IPv6, in the host's own backend (nft or
+/// legacy): Docker Engine, ufw and firewalld set their rules through them.
+const HOST_FIREWALLS: [&str; 2] = ["iptables", "ip6tables"];
+/// Marks the rules Kiri adds, so teardown removes only its own.
+const FORWARD_MARK: &str = "kiri";
+
+/// Where Kiri's bridges need an accept in the host's iptables filter table,
+/// from `iptables -S`: Docker's DOCKER-USER chain when there is one (Docker
+/// keeps it across its own restarts, and its FORWARD policy is DROP), else
+/// the top of FORWARD when its policy drops (ufw, firewalld), else nowhere.
+fn host_forward_chain(listing: &str) -> Option<&'static str> {
+    let lines = || listing.lines().map(str::trim);
+    if lines().any(|l| l == "-N DOCKER-USER") {
+        Some("DOCKER-USER")
+    } else if lines().any(|l| l == "-P FORWARD DROP") {
+        Some("FORWARD")
+    } else {
+        None
+    }
+}
+
+/// The two rules: from and to any Kiri bridge, accepted.
+fn host_forward_rules() -> [[&'static str; 8]; 2] {
+    let rule = |dir| [dir, "kiri+", "-m", "comment", "--comment", FORWARD_MARK, "-j", "ACCEPT"];
+    [rule("-i"), rule("-o")]
+}
+
+fn host_firewall(tool: &str, args: &[&str]) -> io::Result<std::process::Output> {
+    std::process::Command::new(tool).arg("-w").args(args).stdin(std::process::Stdio::null()).output()
+}
+
+/// On a Linux host, every forward hook must accept a packet: Kiri's own
+/// table accepting a container's traffic does not stop a host firewall's
+/// FORWARD chain with policy DROP (Docker Engine sets one, and keeps it
+/// after it stops) from dropping it, and containers then have no network.
+/// So Kiri's bridges get an accept there too; Kiri's own forward chain still
+/// keeps the LAN away from containers. Without iptables there is nothing
+/// to open.
+fn open_host_forward() {
+    open_host_forward_with(&HOST_FIREWALLS);
+}
+
+fn open_host_forward_with(tools: &[&str]) {
+    for &tool in tools {
+        let listing = match host_firewall(tool, &["-S"]) {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => continue,
+        };
+        let Some(chain) = host_forward_chain(&listing) else { continue };
+        for rule in host_forward_rules() {
+            let present = host_firewall(tool, &[&["-C", chain][..], &rule[..]].concat()).is_ok_and(|o| o.status.success());
+            if present {
+                continue;
+            }
+            match host_firewall(tool, &[&["-I", chain, "1"][..], &rule[..]].concat()) {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => eprintln!("kiri-init: {tool} -I {chain}: {}", String::from_utf8_lossy(&o.stderr).trim()),
+                Err(e) => eprintln!("kiri-init: {tool} -I {chain}: {e}"),
+            }
+        }
+    }
+}
+
+/// Removes the rules `open_host_forward` added, from either chain.
+fn close_host_forward() {
+    close_host_forward_with(&HOST_FIREWALLS);
+}
+
+fn close_host_forward_with(tools: &[&str]) {
+    for &tool in tools {
+        for chain in ["DOCKER-USER", "FORWARD"] {
+            for rule in host_forward_rules() {
+                let delete = [&["-D", chain][..], &rule[..]].concat();
+                // One -D removes one copy; a crash may have left several.
+                for _ in 0..16 {
+                    if !host_firewall(tool, &delete).is_ok_and(|o| o.status.success()) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Rebuilds Kiri's IPv4 table as last built, for the bridges there are now.
@@ -627,6 +715,7 @@ pub fn remove_host_network() {
     }
     let _ = netlink::install_nat6(&[], &[]);
     let _ = ipv6_forwarding(false);
+    close_host_forward();
 }
 
 /// Gives a freshly cloned container its network: a veth pair whose peer
@@ -745,6 +834,55 @@ pub fn route(dst: [u8; 4], prefix: u8, via: [u8; 4], add: bool) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `iptables -S` on a host where Docker Engine ran (it stays after
+    /// Docker stops), with ufw, and with neither.
+    const DOCKER: &str = "-P INPUT ACCEPT\n-P FORWARD DROP\n-P OUTPUT ACCEPT\n-N DOCKER\n-N DOCKER-FORWARD\n-N DOCKER-USER\n-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n";
+    const UFW: &str = "-P INPUT DROP\n-P FORWARD DROP\n-P OUTPUT ACCEPT\n-N ufw-before-forward\n-A FORWARD -j ufw-before-forward\n";
+    const OPEN: &str = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n";
+
+    #[test]
+    fn a_host_firewall_that_drops_forwarding_gets_kiris_accept_in_the_right_chain() {
+        assert_eq!(host_forward_chain(DOCKER), Some("DOCKER-USER"));
+        assert_eq!(host_forward_chain(UFW), Some("FORWARD"));
+        assert_eq!(host_forward_chain(OPEN), None);
+        assert_eq!(host_forward_rules()[0], ["-i", "kiri+", "-m", "comment", "--comment", "kiri", "-j", "ACCEPT"]);
+        assert_eq!(host_forward_rules()[1][..2], ["-o", "kiri+"]);
+    }
+
+    /// A stand-in iptables: `-S` prints `listing`, the chain's rules live in
+    /// a file, -C/-I/-D act on it, and every call is logged.
+    fn fake_iptables(dir: &std::path::Path, listing: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = dir.join("iptables");
+        let script = format!(
+            "#!/bin/sh\nd={d}\nshift\necho \"$*\" >> $d/calls\ncase \"$1\" in\n-S) printf '%s' '{listing}' ;;\n-C) shift 2; grep -qxF -- \"$*\" $d/rules 2>/dev/null ;;\n-I) shift 3; echo \"$*\" >> $d/rules ;;\n-D) shift 2; grep -qxF -- \"$*\" $d/rules 2>/dev/null || exit 1; grep -vxF -- \"$*\" $d/rules > $d/r; mv $d/r $d/rules ;;\nesac\n",
+            d = dir.display()
+        );
+        std::fs::write(&tool, script).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tool.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn kiris_forward_accept_is_added_once_and_removed_at_teardown() {
+        let dir = std::env::temp_dir().join(format!("kiri-hostfw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = fake_iptables(&dir, DOCKER);
+        open_host_forward_with(&[&tool]);
+        // A bridge or a published port later rebuilds the table: no second copy.
+        open_host_forward_with(&[&tool]);
+        let rules = std::fs::read_to_string(dir.join("rules")).unwrap();
+        assert_eq!(rules.lines().collect::<Vec<_>>(), ["-i kiri+ -m comment --comment kiri -j ACCEPT", "-o kiri+ -m comment --comment kiri -j ACCEPT"]);
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        assert!(calls.lines().filter(|l| l.starts_with("-I")).all(|l| l.starts_with("-I DOCKER-USER 1 ")), "{calls}");
+        close_host_forward_with(&[&tool]);
+        assert_eq!(std::fs::read_to_string(dir.join("rules")).unwrap(), "");
+        // No iptables at all: nothing to do, and no panic.
+        open_host_forward_with(&[dir.join("missing").to_str().unwrap()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn ipv6_settings_come_from_the_options() {
