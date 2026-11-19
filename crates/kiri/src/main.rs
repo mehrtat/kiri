@@ -43,6 +43,10 @@ mod images;
 mod guest;
 #[cfg(target_os = "linux")]
 mod hostaccess;
+#[cfg(target_os = "linux")]
+// The window's parts (needed, the log-out and restart) stay unused without it.
+#[cfg_attr(not(feature = "window"), allow(dead_code))]
+mod onboarding;
 #[cfg(target_os = "macos")]
 mod import;
 #[cfg(unix)]
@@ -83,7 +87,8 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri daemon
        kiri bridge [--socket PATH]   (WSL2: the end of kiri-win.exe)
        kiri ui [--start] [--view containers|images|volumes|networks]
-       kiri setup [--use] [--no-agent] | kiri setup --uninstall
+       kiri setup [--use] [--no-agent] | kiri setup --uninstall   (Mac)
+       kiri setup [all|running|access|docker|builds|skip X|unskip X]   (Linux: the first-run checklist)
        kiri build-with [docker|kiri]   which builder docker build uses
        kiri update [--check]
        kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]
@@ -145,6 +150,9 @@ fn main() -> ExitCode {
         Some("boot") => boot::run(&args[1..]),
         #[cfg(target_os = "macos")]
         Some("setup") => setup::run(&args[1..]),
+        // Linux: the window's first-run checklist, from a terminal.
+        #[cfg(target_os = "linux")]
+        Some("setup") => onboarding::cli(&args[1..]),
         #[cfg(any(unix, windows))]
         Some("share") => share::run(&args[1..]),
         // `kiri 3000`: share a port straight away.
