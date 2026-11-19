@@ -742,7 +742,7 @@ impl Networks {
 
 /// The first free subnet: 172.17.0.0/16 (only for the default bridge), then
 /// 172.18.0.0/16 … 172.31.0.0/16, then 10.89.N.0/24, skipping ones Kiri
-/// already uses and ones the host routes.
+/// already uses and ones on the host's own links.
 fn free_subnet(taken: &[([u8; 4], u8)], default_bridge: bool) -> Option<([u8; 4], u8)> {
     let routes = host_routes();
     let first = if default_bridge { 17 } else { 18 };
@@ -781,22 +781,32 @@ fn host_routes6() -> Vec<([u8; 16], u8)> {
     Vec::new()
 }
 
-/// The host's own routes as (network, mask), outside Kiri's bridges and the
-/// default route. Only a Linux host shares its routing table with Kiri.
+/// The host's on-link routes as (network, mask), outside Kiri's bridges.
+/// Only a Linux host shares its routing table with Kiri.
 #[cfg(target_os = "linux")]
 fn host_routes() -> Vec<(u32, u32)> {
-    let text = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    on_link_routes(&std::fs::read_to_string("/proc/net/route").unwrap_or_default())
+}
+
+/// The routes in `/proc/net/route`'s text that put the host on a subnet, as
+/// Docker reserves them since 23.0 (moby#42598): not one through a gateway
+/// (OpenVPN's 0.0.0.0/1 and 128.0.0.0/1), an unreachable or prohibit one, or
+/// one to 0.0.0.0 (the default route, a WireGuard 0.0.0.0/1).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn on_link_routes(text: &str) -> Vec<(u32, u32)> {
+    const RTF_GATEWAY: u32 = 0x2;
     text.lines()
         .skip(1)
         .filter_map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
-            if f.len() < 8 || f[0].starts_with("kiri") {
+            // A blackhole or unreachable route has no interface: "*".
+            if f.len() < 8 || f[0].starts_with("kiri") || f[0] == "*" || u32::from_str_radix(f[3], 16).ok()? & RTF_GATEWAY != 0 {
                 return None;
             }
             // Little-endian hex, as the kernel prints them.
             let dest = u32::from_str_radix(f[1], 16).ok()?.swap_bytes();
             let mask = u32::from_str_radix(f[7], 16).ok()?.swap_bytes();
-            (mask != 0).then_some((dest & mask, mask))
+            (dest != 0).then_some((dest & mask, mask))
         })
         .collect()
 }
@@ -971,6 +981,24 @@ mod tests {
         // A user's 172.18.0.0/24 keeps the automatic choice off 172.18.0.0/16.
         let free = free_subnet(&[([172, 17, 0, 0], 16), ([172, 18, 0, 0], 24)], false).unwrap();
         assert!(!overlaps(free, ([172, 18, 0, 0], 24)) && !overlaps(free, ([172, 17, 0, 0], 16)));
+    }
+
+    #[test]
+    fn only_on_link_routes_reserve_subnets() {
+        // As /proc/net/route prints them: an OpenVPN full tunnel (`def1`), a
+        // WireGuard one with no gateway, unreachable 10.0.0.0/8, blackhole 172.16.0.0/12.
+        let text = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+            eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+            tun0\t00000000\t0100080A\t0003\t0\t0\t0\t00000080\t0\t0\t0\n\
+            tun0\t00000080\t0100080A\t0003\t0\t0\t0\t00000080\t0\t0\t0\n\
+            tun0\t0000080A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+            wg0\t00000000\t00000000\t0001\t0\t0\t0\t00000080\t0\t0\t0\n\
+            *\t0000000A\t00000000\t0201\t0\t0\t0\t000000FF\t0\t0\t0\n\
+            *\t000010AC\t00000000\t0001\t0\t0\t0\t0000F0FF\t0\t0\t0\n\
+            eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n\
+            kiri1\t000012AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
+        let lan = |a: [u8; 4]| (u32::from_be_bytes(a), u32::MAX << 8);
+        assert_eq!(on_link_routes(text), [lan([10, 8, 0, 0]), lan([192, 168, 1, 0])]);
     }
 
     #[test]
