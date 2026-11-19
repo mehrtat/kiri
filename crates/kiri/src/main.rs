@@ -55,6 +55,8 @@ mod machine;
 #[cfg(unix)]
 mod run;
 #[cfg(unix)]
+mod registry;
+#[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod scan;
 #[cfg(target_os = "macos")]
@@ -90,6 +92,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri share PORT|CONTAINER [--name N] | share login | logout | status
        kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]
        kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)
+       kiri registry trust HOST [--ca FILE] [--client-cert F --client-key F] [--yes] | ls | rm HOST   a private registry's CA
        kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME
        kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]
        kiri bench [--runs N] [--image IMAGE] [--network none|bridge]
@@ -149,6 +152,8 @@ fn main() -> ExitCode {
         Some(a) if share::is_shorthand(a) => share::run(&args),
         #[cfg(unix)]
         Some("build-with") => buildwith::cli(&args[1..]),
+        #[cfg(unix)]
+        Some("registry") => registry::run(&args[1..]),
         #[cfg(unix)]
         Some("k8s") => k8s::run(&args[1..]),
         #[cfg(unix)]

@@ -262,7 +262,50 @@ fn shared_agent() -> ureq::Agent {
     {
         return agent.clone();
     }
+    let agent = build_agent(&chosen, crate::tls::default_config());
+    *slot = Some((chosen, agent.clone()));
+    agent
+}
+
+/// The agent for a registry with certificates of its own in `certs.d`
+/// (crate::tls), or None for one without, which uses the shared agent. It
+/// is kept until those files or the proxy settings change, so a CA added
+/// for a registry counts from its next request on.
+fn host_agent(dirs: &[std::path::PathBuf], host: &str) -> Result<Option<ureq::Agent>, Error> {
+    type Built = (ProxyChoice, Vec<crate::tls::HostFile>, ureq::Agent);
+    static AGENTS: std::sync::LazyLock<Mutex<HashMap<String, Built>>> = std::sync::LazyLock::new(Default::default);
+    let files = crate::tls::host_files(dirs, host);
+    let mut agents = AGENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if files.is_empty() {
+        agents.remove(host);
+        return Ok(None);
+    }
+    let chosen = PROXY_SOURCE.get().and_then(|f| f());
+    if let Some((c, f, agent)) = agents.get(host)
+        && *c == chosen
+        && *f == files
+    {
+        return Ok(Some(agent.clone()));
+    }
+    let tls = crate::tls::host_config(&files).map_err(|e| Error::Http(format!("certificates for {host}: {e}")))?;
+    let agent = build_agent(&chosen, tls);
+    agents.insert(host.to_owned(), (chosen, files, agent.clone()));
+    Ok(Some(agent))
+}
+
+/// `host:port` of `url`, as `certs.d` names a registry's directory.
+fn url_host(url: &str) -> Option<String> {
+    let uri = url.parse::<ureq::http::Uri>().ok()?;
+    let host = uri.host()?;
+    Some(match uri.port_u16() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
+}
+
+fn build_agent(chosen: &ProxyChoice, tls: ureq::tls::TlsConfig) -> ureq::Agent {
     let mut cfg = ureq::Agent::config_builder()
+        .tls_config(tls)
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(15)))
         .max_idle_age(IDLE)
@@ -276,9 +319,7 @@ fn shared_agent() -> ureq::Agent {
     }
     // Happy Eyeballs rather than ureq's one address after another, so an
     // IPv6 address without a working route does not stall the pull.
-    let agent = ureq::Agent::with_parts(cfg.build(), crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default());
-    *slot = Some((chosen, agent.clone()));
-    agent
+    ureq::Agent::with_parts(cfg.build(), crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default())
 }
 
 /// Bearer tokens (and Basic answers) by registry, repository, actions and
@@ -404,6 +445,29 @@ impl Client {
         Client { agent: shared_agent(), credentials: None }
     }
 
+    /// The agent for a request to `url`: its registry's own when that has
+    /// certificates in `certs.d` (crate::tls), else this client's.
+    fn agent(&self, url: &str) -> Result<ureq::Agent, Error> {
+        self.agent_in(&crate::tls::cert_dirs(), url)
+    }
+
+    /// Whether `host`'s registry answers over https, its certificate
+    /// trusted: the HTTP status of `/v2/` (401 is a registry asking for a
+    /// sign-in), for `kiri registry trust` to check what it installed.
+    pub fn reach(&self, host: &str) -> Result<u16, Error> {
+        let url = format!("https://{host}/v2/");
+        let resp = self.agent(&url)?.get(&url).call()?;
+        Ok(resp.status().as_u16())
+    }
+
+    fn agent_in(&self, dirs: &[std::path::PathBuf], url: &str) -> Result<ureq::Agent, Error> {
+        let own = match url_host(url) {
+            Some(host) => host_agent(dirs, &host)?,
+            None => None,
+        };
+        Ok(own.unwrap_or_else(|| self.agent.clone()))
+    }
+
     /// Who the tokens are for: a fingerprint of the credentials, so one
     /// user's token is never sent for another, or for an anonymous pull.
     fn who(&self) -> String {
@@ -456,10 +520,11 @@ impl Client {
         let known = CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).get(&r.registry).cloned();
         let Some(challenge) = known.or_else(|| (r.registry == "docker.io").then(|| DOCKER_HUB_CHALLENGE.to_owned())) else { return Ok(()) };
         let url = format!("{}/v2/", r.api_base());
+        let agent = self.agent(&url)?;
         std::thread::scope(|s| {
             // Two connections: after the manifests, the config and the first
             // layer are fetched at once.
-            let connections: Vec<_> = (0..2).map(|_| s.spawn(|| self.agent.get(&url).call().map(drain))).collect();
+            let connections: Vec<_> = (0..2).map(|_| s.spawn(|| agent.get(&url).call().map(drain))).collect();
             if let Ok((header, ttl)) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry) {
                 Self::remember_token(key, header, ttl);
             }
@@ -739,8 +804,9 @@ impl Client {
         if from == 0 {
             return self.get(r, url, None);
         }
+        let agent = self.agent(url)?;
         let resp = self.authed(r, "pull", |auth| {
-            let mut req = self.agent.get(url).header("Range", format!("bytes={from}-"));
+            let mut req = agent.get(url).header("Range", format!("bytes={from}-"));
             if let Some(a) = auth {
                 req = req.header("Authorization", a);
             }
@@ -751,9 +817,10 @@ impl Client {
 
     /// GET with registry auth.
     fn get(&self, r: &Reference, url: &str, accept: Option<&str>) -> Result<ureq::http::Response<ureq::Body>, Error> {
+        let agent = self.agent(url)?;
         let resp = self.authed(r, "pull", |auth| {
             let send = || {
-                let mut req = self.agent.get(url);
+                let mut req = agent.get(url);
                 if let Some(a) = accept {
                     req = req.header("Accept", a);
                 }
@@ -836,15 +903,16 @@ impl Client {
             WARNED.call_once(|| eprintln!("kiri: not sending {registry}'s credentials to its token realm {realm}: not https"));
         }
         let creds = self.credentials.as_ref().filter(|_| secure);
+        let agent = self.agent(realm)?;
         let mut resp = if let Some(c) = creds.filter(|c| !c.identity_token.is_empty()) {
             // An identity token is an OAuth refresh token.
             let mut form = vec![("grant_type", "refresh_token"), ("refresh_token", c.identity_token.as_str()), ("service", service), ("client_id", "kiri")];
             if let Some(s) = scope {
                 form.push(("scope", s));
             }
-            self.agent.post(realm.as_str()).send_form(form)?
+            agent.post(realm.as_str()).send_form(form)?
         } else {
-            let mut req = self.agent.get(realm.as_str());
+            let mut req = agent.get(realm.as_str());
             if let Some(s) = scope {
                 req = req.query("scope", s);
             }
@@ -875,7 +943,7 @@ impl Client {
     /// `docker search`, against Docker Hub's search API.
     pub fn search(&self, term: &str, limit: u32) -> Result<Vec<serde_json::Value>, Error> {
         let url = "https://index.docker.io/v1/search";
-        let mut resp = self.agent.get(url).query("q", term).query("n", &limit.to_string()).call()?;
+        let mut resp = self.agent(url)?.get(url).query("q", term).query("n", limit.to_string()).call()?;
         if resp.status().as_u16() != 200 {
             return Err(Error::Status { url: url.to_owned(), status: resp.status().as_u16(), body: String::new() });
         }
@@ -889,7 +957,7 @@ impl Client {
     pub fn hub_tags(&self, repo: &str, limit: u32) -> Result<Vec<String>, Error> {
         let repo = if repo.contains('/') { repo.to_owned() } else { format!("library/{repo}") };
         let url = format!("https://hub.docker.com/v2/repositories/{repo}/tags");
-        let mut resp = self.agent.get(&url).query("page_size", &limit.to_string()).query("ordering", "last_updated").call()?;
+        let mut resp = self.agent(&url)?.get(&url).query("page_size", limit.to_string()).query("ordering", "last_updated").call()?;
         if resp.status().as_u16() != 200 {
             return Err(Error::Status { url, status: resp.status().as_u16(), body: String::new() });
         }
@@ -961,14 +1029,15 @@ impl Client {
         let host = if host.is_empty() || host == "index.docker.io" || host == "docker.io" { "registry-1.docker.io" } else { host };
         let base = format!("{}://{host}", if crate::reference::is_local(host) { "http" } else { "https" });
         let url = format!("{base}/v2/");
-        let resp = self.agent.get(&url).call()?;
+        let agent = self.agent(&url)?;
+        let resp = agent.get(&url).call()?;
         match resp.status().as_u16() {
             200 => Ok(()),
             401 => {
                 let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
                     let (auth, _) = self.answer(&challenge, "", host)?;
-                    let again = self.agent.get(&url).header("Authorization", &auth).call()?;
+                    let again = agent.get(&url).header("Authorization", &auth).call()?;
                     return match again.status().as_u16() {
                         200 => Ok(()),
                         s => Err(Error::Status { url, status: s, body: "unauthorized: incorrect username or password".into() }),
@@ -986,13 +1055,14 @@ impl Client {
     pub fn push(&self, store: &Store, image: &Image, target: &Reference, progress: &dyn Fn(PushProgress)) -> Result<(String, u64), Error> {
         let base = target.api_base();
         let repo = &target.repository;
+        let agent = self.agent(&base)?;
         let config_size = std::fs::metadata(store.blob_path(&image.config_digest)?)?.len();
         let blobs: Vec<(String, u64)> =
             image.layers.iter().map(|l| (l.digest.clone(), l.size)).chain(std::iter::once((image.config_digest.clone(), config_size))).collect();
         for (digest, size) in &blobs {
             let url = format!("{base}/v2/{repo}/blobs/{digest}");
             let head = self.authed(target, "pull,push", |auth| {
-                let mut req = self.agent.head(&url);
+                let mut req = agent.head(&url);
                 if let Some(a) = auth {
                     req = req.header("Authorization", a);
                 }
@@ -1006,7 +1076,7 @@ impl Client {
             // Start an upload session, then send the blob in one PUT.
             let start_url = format!("{base}/v2/{repo}/blobs/uploads/");
             let started = self.authed(target, "pull,push", |auth| {
-                let mut req = self.agent.post(&start_url).header("Content-Length", "0");
+                let mut req = agent.post(&start_url).header("Content-Length", "0");
                 if let Some(a) = auth {
                     req = req.header("Authorization", a);
                 }
@@ -1017,9 +1087,10 @@ impl Client {
             let location = if location.starts_with('/') { format!("{base}{location}") } else { location };
             let put_url = format!("{location}{}digest={digest}", if location.contains('?') { '&' } else { '?' });
             let path = store.blob_path(digest)?;
+            let put_agent = self.agent(&put_url)?;
             let put = self.authed(target, "pull,push", |auth| {
                 let mut f = std::fs::File::open(&path).map_err(ureq::Error::Io)?;
-                let mut req = self.agent.put(&put_url).header("Content-Type", "application/octet-stream").header("Content-Length", &size.to_string());
+                let mut req = put_agent.put(&put_url).header("Content-Type", "application/octet-stream").header("Content-Length", &size.to_string());
                 if let Some(a) = auth {
                     req = req.header("Authorization", a);
                 }
@@ -1037,7 +1108,7 @@ impl Client {
         let bytes = serde_json::to_vec(&manifest).map_err(|e| Error::Manifest(e.to_string()))?;
         let url = format!("{base}/v2/{repo}/manifests/{}", target.reference);
         let put = self.authed(target, "pull,push", |auth| {
-            let mut req = self.agent.put(&url).header("Content-Type", OCI_MANIFEST);
+            let mut req = agent.put(&url).header("Content-Type", OCI_MANIFEST);
             if let Some(a) = auth {
                 req = req.header("Authorization", a);
             }
@@ -1554,5 +1625,31 @@ mod tests {
         assert!(!transient(&Error::Status { url: String::new(), status: 404, body: String::new() }));
         assert!(!transient(&Error::Io(io::Error::new(io::ErrorKind::InvalidData, "digest mismatch"))));
         assert!(!transient(&Error::Io(io::Error::other(ureq::Error::BodyExceedsLimit(10)))));
+    }
+
+    #[test]
+    fn a_registry_a_private_ca_signed_is_reached_once_its_ca_is_in_certs_d() {
+        let (host, server) = crate::tls::test_server(false, 2);
+        let dirs = [std::env::temp_dir().join(format!("kiri-certs-d-{}", std::process::id()))];
+        let _ = std::fs::remove_dir_all(&dirs[0]);
+        let url = format!("https://{host}/v2/");
+        let client = Client::new();
+        let refused = client.agent_in(&dirs, &url).unwrap().get(&url).call();
+        assert!(refused.is_err(), "a private CA's certificate was trusted without its CA: {refused:?}");
+        std::fs::create_dir_all(dirs[0].join(&host)).unwrap();
+        std::fs::write(dirs[0].join(&host).join("ca.crt"), include_bytes!("../testdata/tls/ca.crt")).unwrap();
+        let resp = client.agent_in(&dirs, &url).unwrap().get(&url).call().unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        // Another host keeps the shared agent and the system's roots alone.
+        assert!(host_agent(&dirs, "elsewhere.example").unwrap().is_none());
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dirs[0]);
+    }
+
+    #[test]
+    fn a_requests_host_is_named_as_certs_d_names_it() {
+        assert_eq!(url_host("https://registry.example.com/v2/").as_deref(), Some("registry.example.com"));
+        assert_eq!(url_host("https://10.0.0.5:5000/v2/x/blobs/uploads/?a=b").as_deref(), Some("10.0.0.5:5000"));
+        assert_eq!(url_host("not a url"), None);
     }
 }
