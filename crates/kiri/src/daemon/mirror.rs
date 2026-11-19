@@ -157,7 +157,12 @@ pub fn config(engine: &Engine) -> String {
     let token = token();
     let mut out = String::new();
     for r in registries {
-        out.push_str(&format!("[registry.\"{r}\"]\n  mirrors = [\"{host}/{token}/{r}\"]\n"));
+        // Docker Hub: after Kiri's own images, its mirrors, the fastest
+        // first (kiri_image::mirrors), so a build's FROM pulls where Hub
+        // itself can't be reached.
+        let hub = if r == "docker.io" { kiri_image::mirrors::for_builder() } else { Vec::new() };
+        let more: String = hub.iter().map(|m| format!(", \"{m}\"")).collect();
+        out.push_str(&format!("[registry.\"{r}\"]\n  mirrors = [\"{host}/{token}/{r}\"{more}]\n"));
     }
     out.push_str(&format!("[registry.\"{host}\"]\n  http = true\n"));
     out

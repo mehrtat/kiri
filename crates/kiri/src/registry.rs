@@ -2,6 +2,9 @@
 //! signed, and signing in to one with a client certificate. The files go
 //! where Docker keeps them (`certs.d/<host>/`, kiri_image::tls), which the
 //! engine reads on each request, so they count at once, with no restart.
+//!
+//! `kiri registry mirror`: Docker Hub's mirrors, which a pull of a Hub
+//! image chooses between by how fast each answers (kiri_image::mirrors).
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +14,7 @@ use kiri_image::tls;
 const USAGE: &str = "usage: kiri registry trust HOST [--ca FILE] [--client-cert FILE --client-key FILE] [--yes]\n\
     \x20      kiri registry ls\n\
     \x20      kiri registry rm HOST\n\
+    \x20      kiri registry mirror [ls | test | add HOST... | rm HOST... | builtin on|off]\n\
     HOST is the registry as images name it: registry.example.com, 10.0.0.5:5000.\n\
     Without --ca or a client certificate, trust takes the CA the registry sends,\n\
     once its SHA-256 fingerprint is confirmed (--yes confirms it unasked).";
@@ -18,6 +22,7 @@ const USAGE: &str = "usage: kiri registry trust HOST [--ca FILE] [--client-cert 
 pub fn run(args: &[String]) -> io::Result<()> {
     match args.first().map(String::as_str) {
         Some("trust") => trust(&args[1..]),
+        Some("mirror" | "mirrors") => mirror(&args[1..]),
         Some("ls" | "list") | None => list(),
         Some("rm" | "remove") => match args.get(1) {
             Some(host) => remove(host),
@@ -143,12 +148,134 @@ fn remove(host: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// `kiri registry mirror …`.
+fn mirror(args: &[String]) -> io::Result<()> {
+    use kiri_image::mirrors;
+    let path = mirrors::settings_path();
+    let edit = |f: &dyn Fn(&mut mirrors::Settings) -> io::Result<()>| -> io::Result<()> {
+        let mut s = mirrors::load(&path);
+        f(&mut s)?;
+        mirrors::save(&path, &s).map_err(|e| match e.kind() {
+            io::ErrorKind::PermissionDenied => io::Error::new(e.kind(), format!("{}: permission denied (run it with sudo)", path.display())),
+            _ => io::Error::new(e.kind(), format!("{}: {e}", path.display())),
+        })?;
+        println!("Saved in {}; the next pull uses it.", path.display());
+        Ok(())
+    };
+    let hosts = |rest: &[String]| -> io::Result<Vec<String>> {
+        if rest.is_empty() {
+            return Err(usage());
+        }
+        rest.iter().map(|h| mirrors::host_of(h).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("not a registry host: {h:?}")))).collect()
+    };
+    match args.first().map(String::as_str) {
+        None | Some("ls" | "list") => show(false),
+        Some("test") => show(true),
+        Some("add") => {
+            let new = hosts(&args[1..])?;
+            edit(&|s| {
+                for h in &new {
+                    if !s.mirrors.contains(h) {
+                        s.mirrors.push(h.clone());
+                    }
+                }
+                Ok(())
+            })
+        }
+        Some("rm" | "remove") => {
+            let gone = hosts(&args[1..])?;
+            edit(&|s| {
+                s.mirrors.retain(|m| !gone.contains(m));
+                Ok(())
+            })
+        }
+        Some("builtin") => {
+            let on = match args.get(1).map(String::as_str) {
+                Some("on") => true,
+                Some("off") => false,
+                _ => return Err(usage()),
+            };
+            edit(&|s| {
+                s.builtin = on;
+                Ok(())
+            })
+        }
+        _ => Err(usage()),
+    }
+}
+
+/// The hosts a Hub pull tries, in the order it tries them, each with how
+/// fast it answered; with `test`, also the digest each gives for
+/// `alpine:latest`, beside the one most of them give.
+fn show(test: bool) -> io::Result<()> {
+    use kiri_image::mirrors;
+    let client = kiri_image::Client::new();
+    let settings = mirrors::load(&mirrors::settings_path());
+    let candidates = mirrors::configured();
+    let timed = client.time(&candidates);
+    let order = mirrors::order(&timed);
+    let digests: Vec<(String, Result<String, String>)> = if test {
+        std::thread::scope(|s| {
+            let runs: Vec<_> = order.iter().map(|h| s.spawn(|| (h.clone(), client.mirror_digest(h).map_err(|e| e.to_string())))).collect();
+            runs.into_iter().filter_map(|r| r.join().ok()).collect()
+        })
+    } else {
+        Vec::new()
+    };
+    let common = most_common(digests.iter().filter_map(|(_, d)| d.as_ref().ok()));
+    println!("A Docker Hub pull tries, in this order:");
+    for (i, host) in order.iter().enumerate() {
+        let time = timed.iter().find(|(h, _)| h == host).and_then(|(_, t)| *t).map_or_else(|| "no answer".to_owned(), |t| format!("{} ms", t.as_millis()));
+        let from = if host == mirrors::ORIGIN {
+            "Docker Hub"
+        } else if settings.mirrors.contains(host) {
+            "yours"
+        } else if mirrors::BUILT_IN.contains(&host.as_str()) {
+            "built-in"
+        } else {
+            "daemon.json"
+        };
+        let mut line = format!("{:>3}. {host:<26} {time:>10}  {from}", i + 1);
+        if let Some((_, d)) = digests.iter().find(|(h, _)| h == host) {
+            line.push_str(&match d {
+                Ok(d) if Some(d) == common.as_ref() => "  alpine:latest as most give it".to_owned(),
+                Ok(d) => format!("  alpine:latest DIFFERS: {d}"),
+                Err(e) => format!("  failed: {e}"),
+            });
+        }
+        println!("{line}");
+    }
+    if !settings.builtin {
+        println!("The built-in mirrors are off (kiri registry mirror builtin on).");
+    }
+    Ok(())
+}
+
+/// The value most of `items` share.
+fn most_common<'a>(items: impl Iterator<Item = &'a String>) -> Option<String> {
+    let mut counts: Vec<(&String, usize)> = Vec::new();
+    for d in items {
+        match counts.iter_mut().find(|(x, _)| *x == d) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((d, 1)),
+        }
+    }
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(d, _)| d.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn the_digest_most_give_is_the_common_one() {
+        let v: Vec<String> = ["a", "b", "a", "c"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(most_common(v.iter()).as_deref(), Some("a"));
+        assert_eq!(most_common(std::iter::empty()), None);
     }
 
     #[test]
