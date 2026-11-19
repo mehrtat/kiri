@@ -21,23 +21,34 @@ read -r bv bsum <<<"$(pin ${p}BUILDX)"
 [ -n "$dv" ] && [ -n "$cv" ] && [ -n "$bv" ] || { echo "no ${p}* pins in $pins" >&2; exit 1; }
 mkdir -p "$dir" "$cache"
 dir=$(cd "$dir" && pwd)
-get() { # url file sum
-  local f=$cache/$2
-  if [ ! -f "$f" ]; then
+get() { # file sum url... (each tried in turn: a mirror that fails or sends other bytes is skipped)
+  local name=$1 f=$cache/$1 sum=$2 url
+  shift 2
+  if [ -f "$f" ] && echo "$sum  $f" | sha256sum -c --quiet - 2>/dev/null; then
+    return
+  fi
+  rm -f "$f"
+  for url in "$@"; do
     # HTTPS only, redirects included; a failed download leaves no .part behind.
     # The .part is this process's own, as CI jobs on one machine share the cache.
-    if ! curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o "$f.$$.part" "$1"; then
-      rm -f "$f.$$.part"
-      echo "could not download $1" >&2
-      exit 1
+    if curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o "$f.$$.part" "$url" \
+      && echo "$sum  $f.$$.part" | sha256sum -c --quiet - 2>/dev/null; then
+      mv "$f.$$.part" "$f"
+      return
     fi
-    mv "$f.$$.part" "$f"
-  fi
-  echo "$3  $f" | sha256sum -c --quiet - || { echo "$2 does not match the pinned SHA-256; delete $f and retry" >&2; exit 1; }
+    rm -f "$f.$$.part"
+    echo "could not download $name from $url (or it does not match the pinned SHA-256); trying the next" >&2
+  done
+  echo "could not download $name from any source" >&2
+  exit 1
 }
-get "https://download.docker.com/linux/static/stable/$arch/docker-$dv.tgz" "docker-$dv-$arch.tgz" "$dsum"
-get "https://github.com/docker/compose/releases/download/$cv/docker-compose-linux-$compose_arch" "docker-compose-$cv-$arch" "$csum"
-get "https://github.com/docker/buildx/releases/download/$bv/buildx-$bv.linux-$go_arch" "buildx-$bv-$arch" "$bsum"
+# download.docker.com refuses some countries (403 from Iran); these mirror
+# it file for file, and the pinned SHA-256 decides what is kept.
+static=linux/static/stable/$arch/docker-$dv.tgz
+get "docker-$dv-$arch.tgz" "$dsum" "https://download.docker.com/$static" \
+  "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/$static" "https://mirrors.ustc.edu.cn/docker-ce/$static"
+get "docker-compose-$cv-$arch" "$csum" "https://github.com/docker/compose/releases/download/$cv/docker-compose-linux-$compose_arch"
+get "buildx-$bv-$arch" "$bsum" "https://github.com/docker/buildx/releases/download/$bv/buildx-$bv.linux-$go_arch"
 tar xzf "$cache/docker-$dv-$arch.tgz" -C "$dir" --strip-components=1 docker/docker
 install -m 755 "$cache/docker-compose-$cv-$arch" "$dir/docker-compose"
 install -m 755 "$cache/buildx-$bv-$arch" "$dir/docker-buildx"
