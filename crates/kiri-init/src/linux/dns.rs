@@ -147,9 +147,39 @@ fn send_to(fd: RawFd, data: &[u8], to: &libc::sockaddr_in) {
 
 impl Dns {
     /// Starts answering on a bridge's gateway address (once per bridge).
+    ///
+    /// A gateway's server is kept by bridge name, but its socket holds an
+    /// address. A network removed without the agent hearing of it leaves
+    /// its server behind; then its bridge name comes back with another
+    /// subnet (net.rs makes the bridge afresh), or its subnet comes back on
+    /// another bridge. The first left that bridge's DNS on an address it no
+    /// longer has, the second made every start on the new bridge fail with
+    /// "dns bind: Address in use". Either server is stale and goes here.
     pub fn serve(&mut self, bridge: &str, gateway: [u8; 4]) -> io::Result<()> {
-        if self.servers.iter().any(|s| s.container.is_none() && s.bridges.iter().any(|b| b == bridge)) {
+        let mut stale_bridges = Vec::new();
+        let mut current = false;
+        for s in self.servers.iter().filter(|s| s.container.is_none()) {
+            let ours = s.bridges.iter().any(|b| b == bridge);
+            let here = local_ip(s.sock.as_raw_fd()) == Some(gateway);
+            match (ours, here) {
+                (true, true) => current = true,
+                (true, false) => {}
+                (false, true) => stale_bridges.extend(s.bridges.iter().cloned()),
+                (false, false) => continue,
+            }
+        }
+        if current {
             return Ok(());
+        }
+        // Another bridge's server on this address: that bridge is gone.
+        for b in stale_bridges {
+            self.forget_bridge(&b);
+        }
+        // This bridge's server on its old address.
+        let before = self.servers.len();
+        self.servers.retain(|s| s.container.is_some() || !s.bridges.iter().any(|b| b == bridge));
+        if self.servers.len() != before {
+            self.forget_pending();
         }
         let sock = bound(gateway)?;
         self.servers.push(Server { bridges: vec![bridge.to_owned()], sock, container: None });
@@ -564,10 +594,27 @@ fn framed_reply(got: &[u8]) -> Option<&[u8]> {
     got.get(2..2 + len)
 }
 
+/// The port the embedded DNS answers on; a free one in tests, which run
+/// without root.
+#[cfg(not(test))]
+const PORT: u16 = 53;
+#[cfg(test)]
+const PORT: u16 = 15_353;
+
+/// The IPv4 address a socket is bound to.
+fn local_ip(fd: RawFd) -> Option<[u8; 4]> {
+    // SAFETY: sockaddr_in is plain data; all-zero is valid, then filled in.
+    let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+    // SAFETY: getsockname on our socket into a buffer of the stated size.
+    let r = unsafe { libc::getsockname(fd, (&mut a as *mut libc::sockaddr_in).cast(), &mut len) };
+    (r == 0 && i32::from(a.sin_family) == libc::AF_INET).then(|| a.sin_addr.s_addr.to_ne_bytes())
+}
+
 /// A UDP socket bound to `ip`:53.
 fn bound(ip: [u8; 4]) -> io::Result<OwnedFd> {
     let sock = udp_socket()?;
-    let addr = sockaddr(ip, 53);
+    let addr = sockaddr(ip, PORT);
     // SAFETY: binding to a valid sockaddr_in.
     sys::check(
         unsafe { libc::bind(sock.as_raw_fd(), (&addr as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as u32) } as _,
@@ -620,6 +667,31 @@ fn parse_question(q: &[u8]) -> Option<(String, u16, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{Dns, Pending, Server, response_matches, udp_socket};
+
+    /// A network removed without the agent hearing of it: its bridge name
+    /// comes back with another subnet, and its subnet on another bridge.
+    #[test]
+    fn a_stale_gateway_server_gives_way_to_the_bridge_that_has_its_address() {
+        use std::os::fd::AsRawFd;
+        let (a, b) = ([127, 77, 0, 1], [127, 77, 0, 2]);
+        let mut dns = Dns::default();
+        dns.serve("kiri1", a).unwrap();
+        dns.register("kiri1", ["old"].iter(), [127, 77, 0, 9]);
+        // kiri1 again, now on b: it answers on b, and a is free.
+        dns.serve("kiri1", b).unwrap();
+        assert_eq!(dns.servers.iter().map(|s| super::local_ip(s.sock.as_raw_fd())).collect::<Vec<_>>(), [Some(b)]);
+        drop(super::bound(a).expect("the old address was let go"));
+        // kiri1's old subnet (b) on kiri2: no "Address in use", and kiri1's
+        // server and names go with it.
+        dns.serve("kiri2", b).unwrap();
+        assert_eq!(dns.servers.len(), 1);
+        assert_eq!(dns.servers[0].bridges, ["kiri2"]);
+        assert!(!dns.names.contains_key("kiri1"));
+        // The same bridge on the same address again: kept as it is.
+        let fd = dns.servers[0].sock.as_raw_fd();
+        dns.serve("kiri2", b).unwrap();
+        assert_eq!(dns.servers[0].sock.as_raw_fd(), fd);
+    }
 
     #[test]
     fn host_names_answer_on_every_network() {
