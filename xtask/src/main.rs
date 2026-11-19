@@ -423,15 +423,26 @@ fn windows(root: &Path, debug: bool, arch: WinArch) -> io::Result<()> {
     if !cfg!(windows) {
         return Err(io::Error::other("the Windows bundle is built on Windows, in WSL"));
     }
-    fs::create_dir_all(&linux)?;
-    let wsl = |path: &Path| -> io::Result<String> {
-        let out = Command::new("wsl.exe").args(["wslpath", "-a"]).arg(path.to_string_lossy().replace('\\', "/")).output()?;
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    let (src, out_dir) = (wsl(root)?, wsl(&linux)?);
-    let profile = if debug { Profile::Fast } else { Profile::Release };
-    run(Command::new("wsl.exe").args(["--", "bash", &format!("{src}/scripts/windows-engine.sh"), &src, &out_dir, arch.linux(), profile.dir()]))?;
-    run(Command::new("wsl.exe").args(["--", "sh", &format!("{src}/scripts/kiri-linux.sh"), &src, &out_dir, &format!("{out_dir}/kiri-linux.tar.gz"), arch.linux()]))?;
+    // KIRI_LINUX_PREBUILT: the Linux half is already in `linux`, built on a
+    // Linux machine with the same two scripts (the release workflow's
+    // runners have no WSL2).
+    if std::env::var_os("KIRI_LINUX_PREBUILT").is_some() {
+        for f in ["kiri", "kiri-init", "kiri-linux.tar.gz"] {
+            if !linux.join(f).is_file() {
+                return Err(io::Error::other(format!("KIRI_LINUX_PREBUILT is set but {} is missing", linux.join(f).display())));
+            }
+        }
+    } else {
+        fs::create_dir_all(&linux)?;
+        let wsl = |path: &Path| -> io::Result<String> {
+            let out = Command::new("wsl.exe").args(["wslpath", "-a"]).arg(path.to_string_lossy().replace('\\', "/")).output()?;
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        let (src, out_dir) = (wsl(root)?, wsl(&linux)?);
+        let profile = if debug { Profile::Fast } else { Profile::Release };
+        run(Command::new("wsl.exe").args(["--", "bash", &format!("{src}/scripts/windows-engine.sh"), &src, &out_dir, arch.linux(), profile.dir()]))?;
+        run(Command::new("wsl.exe").args(["--", "sh", &format!("{src}/scripts/kiri-linux.sh"), &src, &out_dir, &format!("{out_dir}/kiri-linux.tar.gz"), arch.linux()]))?;
+    }
     // Assemble the bundle first: the engine, Kiri Linux, the docker CLI,
     // Compose and buildx (pinned, checked, as Kiri.app bundles them) and the
     // install scripts. kiri-win is built last, with the SHA-256 of each of
