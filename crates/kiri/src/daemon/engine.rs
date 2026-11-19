@@ -5628,13 +5628,16 @@ mod save_speed_tests {
             engine.create(Some(format!("speed{i}")), spec, &image).unwrap();
         }
         let (threads, each) = (8, 100);
-        // The same number of plain writes of the same file: temp file, rename.
-        let bytes = std::fs::read(root.join("containers.json")).unwrap();
+        // The same number of plain writes of the same file: encoded, then a
+        // temp file and a rename. The encoding is part of it: on a tmpfs
+        // (/tmp on many Linux machines) the write alone takes microseconds,
+        // and a save's own work then looks like waiting for a sync.
+        let records: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("containers.json")).unwrap()).unwrap();
         let plain = root.join("plain.json");
         let t = std::time::Instant::now();
         for _ in 0..threads * each {
             let tmp = root.join("plain.json.tmp");
-            std::fs::write(&tmp, &bytes).unwrap();
+            std::fs::write(&tmp, serde_json::to_vec(&records).unwrap()).unwrap();
             std::fs::rename(&tmp, &plain).unwrap();
         }
         let unsynced = t.elapsed();
@@ -5646,9 +5649,10 @@ mod save_speed_tests {
         });
         let saves = t.elapsed();
         eprintln!("{} saves from {threads} threads: {saves:?}; the same writes unsynced: {unsynced:?}", threads * each);
-        // Loose, for other tests' disk work running alongside: waiting for
-        // a sync per save is 30 to 40 times the unsynced write on a Mac.
-        assert!(saves < unsynced * 8 + Duration::from_millis(500), "{saves:?} for saves against {unsynced:?} unsynced");
+        // Loose, for other tests' disk work running alongside: the two are
+        // about even, and waiting for a sync per save (5 ms or more on a
+        // Mac) adds several times the encoded write.
+        assert!(saves < unsynced * 3 + Duration::from_millis(500), "{saves:?} for saves against {unsynced:?} unsynced");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
