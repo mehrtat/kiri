@@ -11,6 +11,8 @@ pub mod reference;
 pub mod registry;
 pub mod store;
 pub mod tags;
+pub mod tls;
+pub mod mirrors;
 
 pub use cancel::Cancel;
 pub use reference::Reference;

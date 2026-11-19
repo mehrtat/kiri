@@ -199,6 +199,9 @@ impl Credentials {
 pub struct Client {
     agent: ureq::Agent,
     credentials: Option<Credentials>,
+    /// The host this client asks instead of a reference's registry: one of
+    /// Docker Hub's mirrors (crate::mirrors).
+    host: Option<String>,
 }
 
 impl Default for Client {
@@ -262,7 +265,50 @@ fn shared_agent() -> ureq::Agent {
     {
         return agent.clone();
     }
+    let agent = build_agent(&chosen, crate::tls::default_config());
+    *slot = Some((chosen, agent.clone()));
+    agent
+}
+
+/// The agent for a registry with certificates of its own in `certs.d`
+/// (crate::tls), or None for one without, which uses the shared agent. It
+/// is kept until those files or the proxy settings change, so a CA added
+/// for a registry counts from its next request on.
+fn host_agent(dirs: &[std::path::PathBuf], host: &str) -> Result<Option<ureq::Agent>, Error> {
+    type Built = (ProxyChoice, Vec<crate::tls::HostFile>, ureq::Agent);
+    static AGENTS: std::sync::LazyLock<Mutex<HashMap<String, Built>>> = std::sync::LazyLock::new(Default::default);
+    let files = crate::tls::host_files(dirs, host);
+    let mut agents = AGENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if files.is_empty() {
+        agents.remove(host);
+        return Ok(None);
+    }
+    let chosen = PROXY_SOURCE.get().and_then(|f| f());
+    if let Some((c, f, agent)) = agents.get(host)
+        && *c == chosen
+        && *f == files
+    {
+        return Ok(Some(agent.clone()));
+    }
+    let tls = crate::tls::host_config(&files).map_err(|e| Error::Http(format!("certificates for {host}: {e}")))?;
+    let agent = build_agent(&chosen, tls);
+    agents.insert(host.to_owned(), (chosen, files, agent.clone()));
+    Ok(Some(agent))
+}
+
+/// `host:port` of `url`, as `certs.d` names a registry's directory.
+fn url_host(url: &str) -> Option<String> {
+    let uri = url.parse::<ureq::http::Uri>().ok()?;
+    let host = uri.host()?;
+    Some(match uri.port_u16() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
+}
+
+fn build_agent(chosen: &ProxyChoice, tls: ureq::tls::TlsConfig) -> ureq::Agent {
     let mut cfg = ureq::Agent::config_builder()
+        .tls_config(tls)
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(15)))
         .max_idle_age(IDLE)
@@ -276,9 +322,7 @@ fn shared_agent() -> ureq::Agent {
     }
     // Happy Eyeballs rather than ureq's one address after another, so an
     // IPv6 address without a working route does not stall the pull.
-    let agent = ureq::Agent::with_parts(cfg.build(), crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default());
-    *slot = Some((chosen, agent.clone()));
-    agent
+    ureq::Agent::with_parts(cfg.build(), crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default())
 }
 
 /// Bearer tokens (and Basic answers) by registry, repository, actions and
@@ -401,7 +445,41 @@ fn stale(e: &ureq::Error) -> bool {
 
 impl Client {
     pub fn new() -> Client {
-        Client { agent: shared_agent(), credentials: None }
+        Client { agent: shared_agent(), credentials: None, host: None }
+    }
+
+    /// The agent for a request to `url`: its registry's own when that has
+    /// certificates in `certs.d` (crate::tls), else this client's.
+    fn agent(&self, url: &str) -> Result<ureq::Agent, Error> {
+        self.agent_in(&crate::tls::cert_dirs(), url)
+    }
+
+    /// Whether `host`'s registry answers over https, its certificate
+    /// trusted: the HTTP status of `/v2/` (401 is a registry asking for a
+    /// sign-in), for `kiri registry trust` to check what it installed.
+    pub fn reach(&self, host: &str) -> Result<u16, Error> {
+        let url = format!("https://{host}/v2/");
+        let resp = self.agent(&url)?.get(&url).call()?;
+        Ok(resp.status().as_u16())
+    }
+
+    fn agent_in(&self, dirs: &[std::path::PathBuf], url: &str) -> Result<ureq::Agent, Error> {
+        let own = match url_host(url) {
+            Some(host) => host_agent(dirs, &host)?,
+            None => None,
+        };
+        Ok(own.unwrap_or_else(|| self.agent.clone()))
+    }
+
+    /// `https://host` of the registry this client asks for `r`: a mirror's,
+    /// or `r`'s own.
+    fn base(&self, r: &Reference) -> String {
+        self.host.as_deref().map_or_else(|| r.api_base(), host_base)
+    }
+
+    /// The registry the tokens and challenges of a request for `r` belong to.
+    fn host_key<'a>(&'a self, r: &'a Reference) -> &'a str {
+        self.host.as_deref().unwrap_or(&r.registry)
     }
 
     /// Who the tokens are for: a fingerprint of the credentials, so one
@@ -414,7 +492,7 @@ impl Client {
     }
 
     fn token_key(&self, r: &Reference, actions: &str) -> String {
-        format!("{}/{} {actions} {}", r.registry, r.repository, self.who())
+        format!("{}/{} {actions} {}", self.host_key(r), r.repository, self.who())
     }
 
     fn manifest_key(&self, r: &Reference, reference: &str) -> String {
@@ -453,14 +531,15 @@ impl Client {
         if self.credentials.as_ref().is_some_and(|c| !c.registry_token.is_empty()) || Self::cached_token(&key).is_some() {
             return Ok(());
         }
-        let known = CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).get(&r.registry).cloned();
-        let Some(challenge) = known.or_else(|| (r.registry == "docker.io").then(|| DOCKER_HUB_CHALLENGE.to_owned())) else { return Ok(()) };
-        let url = format!("{}/v2/", r.api_base());
+        let known = CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).get(self.host_key(r)).cloned();
+        let Some(challenge) = known.or_else(|| (self.host_key(r) == "docker.io").then(|| DOCKER_HUB_CHALLENGE.to_owned())) else { return Ok(()) };
+        let url = format!("{}/v2/", self.base(r));
+        let agent = self.agent(&url)?;
         std::thread::scope(|s| {
             // Two connections: after the manifests, the config and the first
             // layer are fetched at once.
-            let connections: Vec<_> = (0..2).map(|_| s.spawn(|| self.agent.get(&url).call().map(drain))).collect();
-            if let Ok((header, ttl)) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry) {
+            let connections: Vec<_> = (0..2).map(|_| s.spawn(|| agent.get(&url).call().map(drain))).collect();
+            if let Ok((header, ttl)) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), self.host_key(r)) {
                 Self::remember_token(key, header, ttl);
             }
             let mut failed = None;
@@ -496,7 +575,104 @@ impl Client {
     /// [`Client::pull`] that `cancel` can stop from another thread: it then
     /// ends with [`Error::Cancelled`], its downloads stopped and no image
     /// recorded. Layers it finished stay in the store, for the next pull.
+    ///
+    /// A Docker Hub image comes from the fastest of Hub and its mirrors
+    /// (crate::mirrors), and from the next when one fails; the layers a
+    /// failed one gave are kept, so the next carries on from them.
     pub fn pull_with(
+        &self,
+        store: &Store,
+        reference: &Reference,
+        platform: &Platform,
+        progress: &(dyn Fn(Progress) + Sync),
+        cancel: &Cancel,
+    ) -> Result<Image, Error> {
+        if reference.registry != "docker.io" || self.host.is_some() {
+            return self.pull_from(store, reference, platform, progress, cancel);
+        }
+        self.pull_via(self.hub_hosts(), store, reference, platform, progress, cancel)
+    }
+
+    /// A Hub pull from each of `hosts` in turn until one works.
+    fn pull_via(
+        &self,
+        hosts: Vec<String>,
+        store: &Store,
+        reference: &Reference,
+        platform: &Platform,
+        progress: &(dyn Fn(Progress) + Sync),
+        cancel: &Cancel,
+    ) -> Result<Image, Error> {
+        let mut errors: Vec<(String, Error)> = Vec::new();
+        for host in hosts {
+            let via = self.via(&host);
+            match via.pull_from(store, reference, platform, progress, cancel) {
+                Ok(image) => {
+                    if !errors.is_empty() {
+                        eprintln!("kiri: pulled {} from {host}", reference.short());
+                    }
+                    return Ok(image);
+                }
+                // Neither is the registry's fault: another would say the same.
+                Err(e @ (Error::Cancelled | Error::NoPlatform { .. })) => return Err(e),
+                Err(e) => {
+                    eprintln!("kiri: {host} could not pull {}: {e}; trying the next registry", reference.short());
+                    crate::mirrors::failed(&host);
+                    errors.push((host, e));
+                }
+            }
+        }
+        Err(hub_error(errors))
+    }
+
+    /// A client for `host`, one of Hub's mirrors or Hub itself; a mirror
+    /// gets no credentials, which are Hub's.
+    fn via(&self, host: &str) -> Client {
+        if host == crate::mirrors::ORIGIN {
+            return Client { agent: self.agent.clone(), credentials: self.credentials.clone(), host: None };
+        }
+        Client { agent: self.agent.clone(), credentials: None, host: Some(host.to_owned()) }
+    }
+
+    /// Hub and its mirrors, the fastest first: timed again every ten minutes.
+    pub fn hub_hosts(&self) -> Vec<String> {
+        let candidates = crate::mirrors::configured();
+        if let Some(order) = crate::mirrors::cached(&candidates) {
+            return order;
+        }
+        let order = crate::mirrors::order(&self.time(&candidates));
+        crate::mirrors::remember(candidates, order.clone());
+        order
+    }
+
+    /// How long each host took to answer `/v2/` (any HTTP answer counts),
+    /// all timed at once; None for no answer within three seconds.
+    pub fn time(&self, hosts: &[String]) -> Vec<(String, Option<Duration>)> {
+        std::thread::scope(|s| {
+            let runs: Vec<_> = hosts
+                .iter()
+                .map(|h| {
+                    s.spawn(move || {
+                        let url = format!("{}/v2/", host_base(h));
+                        let began = Instant::now();
+                        let answered = self.agent(&url).ok().and_then(|a| a.get(&url).config().timeout_global(Some(Duration::from_secs(3))).build().call().ok().map(drain));
+                        (h.clone(), answered.map(|()| began.elapsed()))
+                    })
+                })
+                .collect();
+            runs.into_iter().zip(hosts).map(|(r, h)| r.join().unwrap_or_else(|_| (h.clone(), None))).collect()
+        })
+    }
+
+    /// The digest `host` gives for `library/alpine:latest`, asked as a pull
+    /// would ask it: for `kiri registry mirror test`, to compare with Hub.
+    pub fn mirror_digest(&self, host: &str) -> Result<String, Error> {
+        let r = Reference::parse("alpine:latest").map_err(|e| Error::Http(e.to_string()))?;
+        let (bytes, _) = self.via(host).manifest(&r, &r.reference)?;
+        Ok(sha256_digest(&bytes))
+    }
+
+    fn pull_from(
         &self,
         store: &Store,
         reference: &Reference,
@@ -655,7 +831,7 @@ impl Client {
         if by_digest && let Some(hit) = MANIFESTS.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(hit);
         }
-        let url = format!("{}/v2/{}/manifests/{reference}", r.api_base(), r.repository);
+        let url = format!("{}/v2/{}/manifests/{reference}", self.base(r), r.repository);
         let mut resp = self.get(r, &url, Some(ACCEPT))?;
         let media_type = resp
             .headers()
@@ -684,7 +860,7 @@ impl Client {
     /// progress. Refuses bodies over `max` bytes, and stops (removing what
     /// it wrote) once `cancel` is.
     fn download_with(&self, store: &Store, r: &Reference, digest: &str, max: u64, on_bytes: &dyn Fn(u64), cancel: &Cancel) -> Result<u64, Error> {
-        let url = format!("{}/v2/{}/blobs/{digest}", r.api_base(), r.repository);
+        let url = format!("{}/v2/{}/blobs/{digest}", self.base(r), r.repository);
         let mut out = store.blob_writer(digest)?;
         let mut buf = vec![0u8; 256 * 1024];
         let (mut got, mut told) = (0u64, 0u64);
@@ -739,8 +915,9 @@ impl Client {
         if from == 0 {
             return self.get(r, url, None);
         }
+        let agent = self.agent(url)?;
         let resp = self.authed(r, "pull", |auth| {
-            let mut req = self.agent.get(url).header("Range", format!("bytes={from}-"));
+            let mut req = agent.get(url).header("Range", format!("bytes={from}-"));
             if let Some(a) = auth {
                 req = req.header("Authorization", a);
             }
@@ -751,9 +928,10 @@ impl Client {
 
     /// GET with registry auth.
     fn get(&self, r: &Reference, url: &str, accept: Option<&str>) -> Result<ureq::http::Response<ureq::Body>, Error> {
+        let agent = self.agent(url)?;
         let resp = self.authed(r, "pull", |auth| {
             let send = || {
-                let mut req = self.agent.get(url);
+                let mut req = agent.get(url);
                 if let Some(a) = accept {
                     req = req.header("Accept", a);
                 }
@@ -789,12 +967,12 @@ impl Client {
             if rsp.status().as_u16() == 401 && attempt == 0 {
                 let challenge = rsp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 drain(rsp);
-                let (answer, ttl) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry).map_err(|e| match e {
-                    Error::Status { url, status, body } if url.is_empty() => Error::Status { url: r.api_base(), status, body },
+                let (answer, ttl) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), self.host_key(r)).map_err(|e| match e {
+                    Error::Status { url, status, body } if url.is_empty() => Error::Status { url: self.base(r), status, body },
                     e => e,
                 })?;
                 if let Some(c) = without_scope(&challenge) {
-                    CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).insert(r.registry.clone(), c);
+                    CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).insert(self.host_key(r).to_owned(), c);
                 }
                 Self::remember_token(key.clone(), answer, ttl);
                 continue;
@@ -802,7 +980,7 @@ impl Client {
             resp = Some(rsp);
             break;
         }
-        resp.ok_or_else(|| Error::Status { url: r.api_base(), status: 401, body: "unauthorized after token refresh".into() })
+        resp.ok_or_else(|| Error::Status { url: self.base(r), status: 401, body: "unauthorized after token refresh".into() })
     }
 
     /// The `Authorization` header that answers a `WWW-Authenticate` challenge
@@ -836,15 +1014,16 @@ impl Client {
             WARNED.call_once(|| eprintln!("kiri: not sending {registry}'s credentials to its token realm {realm}: not https"));
         }
         let creds = self.credentials.as_ref().filter(|_| secure);
+        let agent = self.agent(realm)?;
         let mut resp = if let Some(c) = creds.filter(|c| !c.identity_token.is_empty()) {
             // An identity token is an OAuth refresh token.
             let mut form = vec![("grant_type", "refresh_token"), ("refresh_token", c.identity_token.as_str()), ("service", service), ("client_id", "kiri")];
             if let Some(s) = scope {
                 form.push(("scope", s));
             }
-            self.agent.post(realm.as_str()).send_form(form)?
+            agent.post(realm.as_str()).send_form(form)?
         } else {
-            let mut req = self.agent.get(realm.as_str());
+            let mut req = agent.get(realm.as_str());
             if let Some(s) = scope {
                 req = req.query("scope", s);
             }
@@ -875,7 +1054,7 @@ impl Client {
     /// `docker search`, against Docker Hub's search API.
     pub fn search(&self, term: &str, limit: u32) -> Result<Vec<serde_json::Value>, Error> {
         let url = "https://index.docker.io/v1/search";
-        let mut resp = self.agent.get(url).query("q", term).query("n", &limit.to_string()).call()?;
+        let mut resp = self.agent(url)?.get(url).query("q", term).query("n", limit.to_string()).call()?;
         if resp.status().as_u16() != 200 {
             return Err(Error::Status { url: url.to_owned(), status: resp.status().as_u16(), body: String::new() });
         }
@@ -889,7 +1068,7 @@ impl Client {
     pub fn hub_tags(&self, repo: &str, limit: u32) -> Result<Vec<String>, Error> {
         let repo = if repo.contains('/') { repo.to_owned() } else { format!("library/{repo}") };
         let url = format!("https://hub.docker.com/v2/repositories/{repo}/tags");
-        let mut resp = self.agent.get(&url).query("page_size", &limit.to_string()).query("ordering", "last_updated").call()?;
+        let mut resp = self.agent(&url)?.get(&url).query("page_size", limit.to_string()).query("ordering", "last_updated").call()?;
         if resp.status().as_u16() != 200 {
             return Err(Error::Status { url, status: resp.status().as_u16(), body: String::new() });
         }
@@ -905,7 +1084,7 @@ impl Client {
         // The list comes a page at a time, in name order: all of it is read
         // (up to `TAG_PAGES` pages) before the newest can be picked out.
         const TAG_PAGES: usize = 20;
-        let base = r.api_base();
+        let base = self.base(r);
         let mut url = format!("{base}/v2/{}/tags/list?n=1000", r.repository);
         let mut tags: Vec<String> = Vec::new();
         for _ in 0..TAG_PAGES {
@@ -942,7 +1121,7 @@ impl Client {
         // Only a well-formed digest goes into the URL.
         let config = match manifest["config"]["digest"].as_str() {
             Some(digest) if manifest["manifests"].is_null() && crate::store::digest_hex(digest).is_ok() => {
-                let url = format!("{}/v2/{}/blobs/{digest}", r.api_base(), r.repository);
+                let url = format!("{}/v2/{}/blobs/{digest}", self.base(r), r.repository);
                 self.get(r, &url, None)
                     .ok()
                     .and_then(|mut resp| resp.body_mut().with_config().limit(4 << 20).read_to_vec().ok())
@@ -961,14 +1140,15 @@ impl Client {
         let host = if host.is_empty() || host == "index.docker.io" || host == "docker.io" { "registry-1.docker.io" } else { host };
         let base = format!("{}://{host}", if crate::reference::is_local(host) { "http" } else { "https" });
         let url = format!("{base}/v2/");
-        let resp = self.agent.get(&url).call()?;
+        let agent = self.agent(&url)?;
+        let resp = agent.get(&url).call()?;
         match resp.status().as_u16() {
             200 => Ok(()),
             401 => {
                 let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
                     let (auth, _) = self.answer(&challenge, "", host)?;
-                    let again = self.agent.get(&url).header("Authorization", &auth).call()?;
+                    let again = agent.get(&url).header("Authorization", &auth).call()?;
                     return match again.status().as_u16() {
                         200 => Ok(()),
                         s => Err(Error::Status { url, status: s, body: "unauthorized: incorrect username or password".into() }),
@@ -984,15 +1164,16 @@ impl Client {
     /// Uploads `image` as `target` (`docker push`): blobs the registry
     /// lacks, then a manifest. Returns the manifest's digest and size.
     pub fn push(&self, store: &Store, image: &Image, target: &Reference, progress: &dyn Fn(PushProgress)) -> Result<(String, u64), Error> {
-        let base = target.api_base();
+        let base = self.base(target);
         let repo = &target.repository;
+        let agent = self.agent(&base)?;
         let config_size = std::fs::metadata(store.blob_path(&image.config_digest)?)?.len();
         let blobs: Vec<(String, u64)> =
             image.layers.iter().map(|l| (l.digest.clone(), l.size)).chain(std::iter::once((image.config_digest.clone(), config_size))).collect();
         for (digest, size) in &blobs {
             let url = format!("{base}/v2/{repo}/blobs/{digest}");
             let head = self.authed(target, "pull,push", |auth| {
-                let mut req = self.agent.head(&url);
+                let mut req = agent.head(&url);
                 if let Some(a) = auth {
                     req = req.header("Authorization", a);
                 }
@@ -1006,7 +1187,7 @@ impl Client {
             // Start an upload session, then send the blob in one PUT.
             let start_url = format!("{base}/v2/{repo}/blobs/uploads/");
             let started = self.authed(target, "pull,push", |auth| {
-                let mut req = self.agent.post(&start_url).header("Content-Length", "0");
+                let mut req = agent.post(&start_url).header("Content-Length", "0");
                 if let Some(a) = auth {
                     req = req.header("Authorization", a);
                 }
@@ -1017,9 +1198,10 @@ impl Client {
             let location = if location.starts_with('/') { format!("{base}{location}") } else { location };
             let put_url = format!("{location}{}digest={digest}", if location.contains('?') { '&' } else { '?' });
             let path = store.blob_path(digest)?;
+            let put_agent = self.agent(&put_url)?;
             let put = self.authed(target, "pull,push", |auth| {
                 let mut f = std::fs::File::open(&path).map_err(ureq::Error::Io)?;
-                let mut req = self.agent.put(&put_url).header("Content-Type", "application/octet-stream").header("Content-Length", &size.to_string());
+                let mut req = put_agent.put(&put_url).header("Content-Type", "application/octet-stream").header("Content-Length", &size.to_string());
                 if let Some(a) = auth {
                     req = req.header("Authorization", a);
                 }
@@ -1037,7 +1219,7 @@ impl Client {
         let bytes = serde_json::to_vec(&manifest).map_err(|e| Error::Manifest(e.to_string()))?;
         let url = format!("{base}/v2/{repo}/manifests/{}", target.reference);
         let put = self.authed(target, "pull,push", |auth| {
-            let mut req = self.agent.put(&url).header("Content-Type", OCI_MANIFEST);
+            let mut req = agent.put(&url).header("Content-Type", OCI_MANIFEST);
             if let Some(a) = auth {
                 req = req.header("Authorization", a);
             }
@@ -1045,6 +1227,27 @@ impl Client {
         })?;
         ok(put, &url)?;
         Ok((sha256_digest(&bytes), bytes.len() as u64))
+    }
+}
+
+/// `https://host`, or `http://host` for one on this machine (Reference::api_base).
+fn host_base(host: &str) -> String {
+    format!("{}://{host}", if crate::reference::is_local(host) { "http" } else { "https" })
+}
+
+/// What a Hub pull says when every host failed: "not found" if one said
+/// so (a mirror that has no such image, or Hub that has none), else what
+/// the first, the fastest, said, naming each host's answer.
+fn hub_error(errors: Vec<(String, Error)>) -> Error {
+    if errors.is_empty() {
+        return Error::Http("no registry to pull from".into());
+    }
+    let summary = errors.iter().map(|(h, e)| format!("{h}: {e}")).collect::<Vec<_>>().join("; ");
+    let mut errors = errors;
+    let i = errors.iter().position(|(_, e)| matches!(e, Error::NotFound(_))).unwrap_or(0);
+    match errors.swap_remove(i).1 {
+        Error::NotFound(m) => Error::NotFound(m),
+        _ => Error::Http(format!("every registry failed: {summary}")),
     }
 }
 
@@ -1241,6 +1444,61 @@ mod tests {
         (host, asked)
     }
 
+    #[test]
+    fn a_hub_pull_moves_on_to_the_next_registry_when_one_fails() {
+        let layer = b"a layer".to_vec();
+        let config = br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["sh"]}}"#.to_vec();
+        let (ld, cd) = (sha256_digest(&layer), sha256_digest(&config));
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2, "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cd, "size": config.len()},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": ld, "size": layer.len()}],
+        }))
+        .unwrap();
+        let (down, down_asked) = path_server(|_| (500, "text/plain", b"down".to_vec()));
+        let (cd2, ld2) = (cd.clone(), ld.clone());
+        let (up, up_asked) = path_server(move |path| {
+            if path == "/v2/library/alpine/manifests/latest" {
+                (200, OCI_MANIFEST, manifest.clone())
+            } else if path.ends_with(&cd2) {
+                (200, "application/octet-stream", config.clone())
+            } else if path.ends_with(&ld2) {
+                (200, "application/octet-stream", layer.clone())
+            } else {
+                (404, "application/json", b"{}".to_vec())
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("kiri-hub-failover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        let r = Reference::parse("alpine").unwrap();
+        let image = test_client().pull_via(vec![down.clone(), up.clone()], &store, &r, &Platform::host_linux(), &|_| {}, &Cancel::new()).unwrap();
+        assert_eq!(image.name, "alpine:latest");
+        assert_eq!(image.config.cmd, ["sh"]);
+        assert!(store.has_blob(&ld, 7));
+        assert!(down_asked.lock().unwrap().iter().any(|p| p.contains("/manifests/")), "the first registry was not tried");
+        assert!(up_asked.lock().unwrap().iter().any(|p| p.ends_with(&ld)));
+        // Every one failing names each, and a "no such image" wins.
+        let (missing, _) = path_server(|_| (404, "application/json", br#"{"errors":[{"code":"MANIFEST_UNKNOWN"}]}"#.to_vec()));
+        let other = Reference::parse("other").unwrap();
+        let err = test_client().pull_via(vec![down, missing], &store, &other, &Platform::host_linux(), &|_| {}, &Cancel::new()).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hosts_are_timed_and_silence_is_none() {
+        let (up, _) = path_server(|_| (401, "application/json", b"{}".to_vec()));
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let timed = test_client().time(&[up.clone(), dead.clone()]);
+        assert_eq!(timed[0].0, up);
+        assert!(timed[0].1.is_some(), "a 401 is an answer");
+        assert_eq!(timed[1], (dead, None));
+    }
+
     // The answer stands without the config: a cache missing the blob (or a
     // rate limit on it) leaves the platforms empty, and a malformed config
     // digest is never put in a URL.
@@ -1306,9 +1564,9 @@ mod tests {
     #[test]
     fn tokens_are_kept_apart_by_who_asked() {
         let r = Reference::parse("alpine").unwrap();
-        let anon = Client { agent: shared_agent(), credentials: None };
-        let alice = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "a".into(), ..Default::default() }) };
-        let other = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "b".into(), ..Default::default() }) };
+        let anon = Client { agent: shared_agent(), credentials: None, host: None };
+        let alice = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "a".into(), ..Default::default() }), host: None };
+        let other = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "b".into(), ..Default::default() }), host: None };
         let keys = [anon.token_key(&r, "pull"), alice.token_key(&r, "pull"), other.token_key(&r, "pull"), alice.token_key(&r, "pull,push")];
         for (i, a) in keys.iter().enumerate() {
             for b in &keys[i + 1..] {
@@ -1414,7 +1672,7 @@ mod tests {
     fn test_client() -> Client {
         let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_millis(300)), ureq::unversioned::resolver::DefaultResolver::default());
-        Client { agent, credentials: None }
+        Client { agent, credentials: None, host: None }
     }
 
     fn blob() -> (Vec<u8>, String) {
@@ -1512,7 +1770,7 @@ mod tests {
         // Stalls only give up after 10 s: the cancel must not wait for that.
         let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_secs(10)), ureq::unversioned::resolver::DefaultResolver::default());
-        let client = Client { agent, credentials: None };
+        let client = Client { agent, credentials: None, host: None };
         let cancel = Cancel::new();
         let c = cancel.clone();
         std::thread::spawn(move || {
@@ -1554,5 +1812,31 @@ mod tests {
         assert!(!transient(&Error::Status { url: String::new(), status: 404, body: String::new() }));
         assert!(!transient(&Error::Io(io::Error::new(io::ErrorKind::InvalidData, "digest mismatch"))));
         assert!(!transient(&Error::Io(io::Error::other(ureq::Error::BodyExceedsLimit(10)))));
+    }
+
+    #[test]
+    fn a_registry_a_private_ca_signed_is_reached_once_its_ca_is_in_certs_d() {
+        let (host, server) = crate::tls::test_server(false, 2);
+        let dirs = [std::env::temp_dir().join(format!("kiri-certs-d-{}", std::process::id()))];
+        let _ = std::fs::remove_dir_all(&dirs[0]);
+        let url = format!("https://{host}/v2/");
+        let client = Client::new();
+        let refused = client.agent_in(&dirs, &url).unwrap().get(&url).call();
+        assert!(refused.is_err(), "a private CA's certificate was trusted without its CA: {refused:?}");
+        std::fs::create_dir_all(dirs[0].join(&host)).unwrap();
+        std::fs::write(dirs[0].join(&host).join("ca.crt"), include_bytes!("../testdata/tls/ca.crt")).unwrap();
+        let resp = client.agent_in(&dirs, &url).unwrap().get(&url).call().unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        // Another host keeps the shared agent and the system's roots alone.
+        assert!(host_agent(&dirs, "elsewhere.example").unwrap().is_none());
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dirs[0]);
+    }
+
+    #[test]
+    fn a_requests_host_is_named_as_certs_d_names_it() {
+        assert_eq!(url_host("https://registry.example.com/v2/").as_deref(), Some("registry.example.com"));
+        assert_eq!(url_host("https://10.0.0.5:5000/v2/x/blobs/uploads/?a=b").as_deref(), Some("10.0.0.5:5000"));
+        assert_eq!(url_host("not a url"), None);
     }
 }

@@ -23,6 +23,10 @@ notice 'Simple Icons 16.35.0 — CC0' 'https://unpkg.com/simple-icons@16.35.0/LI
 notice 'Linux guest kernel — GPL-2.0-only' 'https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt'
 printf '\nGuest kernel source offer\n----------------------------------------------------------------------\n\n' >> "$tmp"
 cat guest/kernel/SOURCE_OFFER.md >> "$tmp"
+# The window's bundled terminal, licensed in its own folder.
+rule='----------------------------------------------------------------------'
+printf '\n%s\n%s\n%s\n%s\nSource: %s\n\n' "$rule" 'xterm.js 6.0.0, @xterm/addon-fit 0.11.0, @xterm/addon-search 0.16.0,' '@xterm/addon-web-links 0.12.0 — MIT' "$rule" 'https://github.com/xtermjs/xterm.js (crates/kiri/src/ui/xterm)' >> "$tmp"
+cat crates/kiri/src/ui/xterm/LICENSE >> "$tmp"
 sed -e 's/\r$//' -e 's/[[:blank:]]*$//' "$tmp" > "$tmp.clean"
 mv "$tmp.clean" "$tmp"
 mv "$tmp" NOTICE
