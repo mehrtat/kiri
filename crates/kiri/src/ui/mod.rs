@@ -17,6 +17,8 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(target_os = "macos")]
+mod macsetup;
+#[cfg(target_os = "macos")]
 use mac as window;
 #[cfg(target_os = "linux")]
 mod gtk;
@@ -1345,6 +1347,14 @@ fn pull_error(e: &str, from: &str, tag: &str) -> String {
     }
 }
 
+/// The page's "fonts" event, made once: CoreText or fontconfig take a second
+/// or two to list 400+ families the first time (about 1.1 s and 1 s for the
+/// fixed-pitch ones on a Mac). Fonts installed later show after a restart.
+fn fonts_event() -> &'static str {
+    static EVENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EVENT.get_or_init(|| serde_json::json!({"type": "fonts", "families": window::font_families(false), "mono": window::font_families(true)}).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1427,6 +1437,32 @@ mod tests {
     }
 
     #[test]
+    fn fonts_are_listed_once() {
+        let first = super::fonts_event();
+        let t = std::time::Instant::now();
+        let again = super::fonts_event();
+        assert!(std::ptr::eq(first, again) && t.elapsed() < std::time::Duration::from_millis(5));
+        let v: serde_json::Value = serde_json::from_str(first).unwrap();
+        assert_eq!(v["type"], "fonts");
+        assert!(v["families"].as_array().is_some_and(|a| !a.is_empty()) && v["mono"].is_array());
+    }
+
+    /// Run with `--ignored --nocapture` to see how long listing takes; Settings
+    /// asks once, off the main thread, and the page keeps the answer.
+    #[test]
+    #[ignore]
+    fn font_listing_time() {
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let all = super::window::font_families(false);
+            let a = t.elapsed();
+            let t = std::time::Instant::now();
+            let mono = super::window::font_families(true);
+            eprintln!("font_families: {} in {a:?}, mono {} in {:?}", all.len(), mono.len(), t.elapsed());
+        }
+    }
+
+    #[test]
     fn catalog_is_sorted_for_binary_search() {
         assert!(super::brands::IMAGES.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(super::brands::BRANDS.windows(2).all(|w| w[0].0 < w[1].0));
@@ -1490,7 +1526,7 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         }
         // Settings: font lists, read off the main thread so the window keeps drawing.
         "fonts" => {
-            std::thread::spawn(|| emit(serde_json::json!({"type": "fonts", "families": window::font_families(false), "mono": window::font_families(true)}).to_string()));
+            std::thread::spawn(|| emit(fonts_event().to_owned()));
             Ok(())
         }
         // About's Check now.
@@ -2104,6 +2140,12 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         }
         // The page is loaded, so events sent from now on will land.
         "ready" => {
+            // Listing the fonts takes a second or two the first time: done
+            // now, off the main thread, so Settings has them at once.
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(3));
+                fonts_event();
+            });
             if let Some(v) = view {
                 let mut ev = String::from(r#"{"type":"view","view":"#);
                 json_str(&mut ev, v);
@@ -2160,6 +2202,15 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
                     return;
                 }
             }
+            // The Mac: the first launch's steps that failed wait in the same
+            // checklist, over a window that works (the engine starts anyway).
+            #[cfg(target_os = "macos")]
+            {
+                let checks = macsetup::checks();
+                if macsetup::needed(&checks) {
+                    emit(checks.to_string());
+                }
+            }
             let _ = tx.send(Cmd::Refresh);
             // Opening the window reaches the engine (starting its service if it
             // isn't running) but doesn't wake it: asleep, it reads Ready, and the
@@ -2196,6 +2247,39 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
             emit(linux::onboarding::checks().to_string());
             Ok(())
         }
+        // The Mac's checklist: Try again for one step, Skip for an optional
+        // one; Open Kiri only closes it, the engine is already reached.
+        #[cfg(target_os = "macos")]
+        "onbcheck" => {
+            emit(macsetup::checks().to_string());
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        "onbfix" => {
+            let what = msg.name;
+            std::thread::spawn(move || {
+                // Fix all: every step still undone, in order.
+                let steps: Vec<String> = if what == "all" { crate::setup::undone().into_iter().map(|(s, _)| s.to_owned()).collect() } else { vec![what.clone()] };
+                // Every step is tried, even after one fails (not try_fold).
+                #[allow(clippy::manual_try_fold)]
+                let result = steps.iter().map(|s| crate::setup::retry(s)).fold(Ok(()), |acc, r| acc.and(r));
+                let mut checks = macsetup::checks();
+                if let Err(e) = result {
+                    diag::warn!("action failed", action = "setup step", target = what, error = e);
+                    checks["error"] = e.to_string().into();
+                }
+                emit(checks.to_string());
+            });
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        "onbskip" => {
+            macsetup::skip(&msg.name, msg.value.as_bool() == Some(false));
+            emit(macsetup::checks().to_string());
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        "onbopen" => tx.send(Cmd::Refresh),
         #[cfg(target_os = "linux")]
         "onbopen" => {
             let _ = tx.send(Cmd::Refresh);
