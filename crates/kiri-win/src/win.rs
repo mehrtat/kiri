@@ -21,7 +21,7 @@ use windows_sys::Win32::System::LibraryLoader::SetDefaultDllDirectories;
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetExitCodeProcess, IsWow64Process2, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
-use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, WM_SETTINGCHANGE};
+use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, WM_NULL, WM_SETTINGCHANGE};
 
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 
@@ -161,6 +161,21 @@ pub fn environment_changed() {
     // call (SendMessageTimeout waits, at most 5 s per window).
     unsafe {
         SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, what.as_ptr() as isize, SMTO_ABORTIFHUNG, 5000, &mut result);
+    }
+}
+
+/// Whether a window of class `class` is open and answers within a second.
+/// One whose process is being killed, or is hung, does not.
+pub fn window_answers(class: *const u16) -> bool {
+    // SAFETY: looking a window up by a NUL-terminated class name, then a
+    // no-op message to it with a timeout.
+    unsafe {
+        let h = FindWindowW(class, std::ptr::null());
+        if h == 0 {
+            return false;
+        }
+        let mut result = 0usize;
+        SendMessageTimeoutW(h, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 1000, &mut result) != 0
     }
 }
 
