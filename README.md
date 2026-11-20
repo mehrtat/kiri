@@ -14,7 +14,8 @@
   <a href="https://runkiri.com/releases/">Download</a> ·
   <a href="docs/features.md">Features</a> ·
   <a href="docs/development.md">Build from source</a> ·
-  <a href="https://github.com/libracoder/kiri/releases">Releases</a>
+  <a href="https://github.com/libracoder/kiri/releases">Releases</a> ·
+  <a href="#about-this-fork">About this fork</a>
 </p>
 
 <p align="center">
@@ -39,6 +40,83 @@ Rust. It runs containers in one small Linux VM (or straight on the kernel on
 Linux) and speaks the Docker Engine API, so your tools just work.
 
 The name comes from the Igbo word *ntakịrị*, "small".
+
+## About this fork
+
+This is a fork of [libracoder/kiri](https://github.com/libracoder/kiri). It
+follows upstream and adds fixes that came up running Kiri all day on build
+machines, many of them in Iran, where Docker Hub and Docker's download site
+answer 403. None of it is specific to one project: it helps anyone whose
+networks come and go, whose Linux host ran Docker Engine before, or who
+cannot reach Docker Hub.
+
+Get it from [the fork's releases](https://github.com/mehrtat/kiri/releases):
+`Kiri-<version>-x86_64.msi` for Windows, `.deb` and `.rpm` for Linux, each
+with a `SHA256SUMS` file. The fork numbers its own releases (0.3.0 on), so
+its version numbers do not match upstream's.
+
+### What it adds
+
+Pulls and builds where Docker Hub can't be reached:
+
+- **Docker Hub through the fastest mirror.** A pull of a Hub image times Hub
+  and its mirrors, starts with the fastest and moves on when one fails,
+  keeping the layers it already has. The built-in list has Iranian mirrors
+  (ArvanCloud, Liara, Focker, HamDocker, IranServer, MobinHost, Kernel,
+  docker.ir) and foreign ones (mirror.gcr.io, Timeweb, DaoCloud). Your own
+  mirrors and Docker's `registry-mirrors` come first. Credentials go only to
+  Docker Hub, never to a mirror. Kiri's BuildKit builder (`kiri-build`) gets
+  the same mirrors for `FROM`.
+- **Registries signed by a private CA.** Kiri trusts the system's certificate
+  store and, per registry, `certs.d/<host>/` as Docker does.
+- **Linux packages build where download.docker.com refuses the country**: the
+  docker CLI comes from a mirror, checked against the same pinned SHA-256.
+
+New commands:
+
+```sh
+kiri registry mirror            # the order a pull tries, with each host's time
+kiri registry mirror test       # also compares the digest each gives for alpine:latest
+kiri registry mirror add HOST   # also: rm HOST, builtin on|off
+kiri registry trust HOST        # install a registry's CA (and a client certificate)
+kiri registry ls                # also: rm HOST
+kiri setup                      # Linux: the window's first-run checklist in a terminal
+kiri setup all                  # or: running, access, docker, builds
+```
+
+Fixes:
+
+- **Containers have a network on Linux hosts that ran Docker Engine, or use
+  ufw or firewalld.** Docker leaves the iptables `FORWARD` policy at `DROP`.
+  Kiri now adds an accept for its own bridges to `DOCKER-USER` (or `FORWARD`)
+  and removes it when it stops.
+- **No more `dns: dns bind: Address in use (os error 98)`** after networks
+  come and go, as with `docker compose up` and `down` all day. A network's
+  DNS server left behind by a missed removal is dropped. An exec's process (a
+  `docker exec`, or a healthcheck) no longer keeps a copy of the engine's
+  sockets.
+- **Windows: Kiri keeps serving `\\.\pipe\kiri` when it is stopped and
+  started again at once.** The new kiri-win used to find the pipe still held
+  by the old one and quit, leaving no Kiri at all. It now waits for the old
+  one to go.
+- **Windows installer** built on GitHub with every release.
+
+Each release's notes are in [docs/releases](docs/releases).
+
+### Good to know
+
+- The Windows installer is not Authenticode-signed, so SmartScreen asks
+  before running it.
+- On Windows, Kiri gives back memory only when WSL lets it. WSL keeps file
+  cache to itself unless `%USERPROFILE%\.wslconfig` has:
+  ```ini
+  [experimental]
+  autoMemoryReclaim=dropCache
+  ```
+  It applies after `wsl --shutdown`, and it covers every WSL distro.
+- `docker build` uses whichever buildx builder is current. Another BuildKit
+  container (`buildx_buildkit_default`, say) does not get Kiri's mirrors; use
+  `--builder kiri-build`, or `docker buildx use kiri-build`.
 
 ## Why Kiri
 
