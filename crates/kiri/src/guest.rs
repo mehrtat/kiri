@@ -126,6 +126,8 @@ pub struct Guest {
     pub timings: BootTimings,
 }
 
+const STOPPED_EARLY: &str = "guest stopped before connecting";
+
 impl Guest {
     pub fn boot(opts: &BootOptions) -> io::Result<Guest> {
         // The Intel build opened on Apple Silicon runs under Rosetta, where
@@ -157,7 +159,14 @@ impl Guest {
         };
         #[cfg(target_os = "macos")]
         let cfg = Self::vm_config(opts)?;
-        Self::start(cfg)
+        Self::start(cfg).map_err(|e| {
+            // The agent says why on its console, which goes to a file: the
+            // daemon's log otherwise read only "exit status: 1".
+            match opts.console_log.as_deref().filter(|_| e.to_string().starts_with(STOPPED_EARLY)).and_then(crate::diag::console::agent_error) {
+                Some(why) => io::Error::new(e.kind(), format!("{e}: {why}")),
+                None => e,
+            }
+        })
     }
 
     /// The VM: kernel, initramfs, data disk, NAT, the Mac's files, Rosetta.
@@ -200,7 +209,7 @@ impl Guest {
         let conn = match vm.next_event(Duration::from_secs(10)) {
             Some(Event::GuestConnected(fd)) => File::from(fd),
             Some(Event::Stopped(why)) => {
-                return Err(io::Error::other(format!("guest stopped before connecting: {why:?}")));
+                return Err(io::Error::other(format!("{STOPPED_EARLY}: {why:?}")));
             }
             None => return Err(io::Error::new(io::ErrorKind::TimedOut, "guest did not connect within 10 s")),
         };
