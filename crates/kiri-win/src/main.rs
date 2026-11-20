@@ -13,6 +13,9 @@
 
 #[cfg(windows)]
 mod app;
+// Taking the pipe over from a kiri-win still going away: plain code.
+#[cfg(any(windows, test))]
+mod handover;
 // The address the window's page is served at, from memory: plain code,
 // tested on any host.
 #[cfg(any(windows, test))]
@@ -162,7 +165,16 @@ fn main() -> std::process::ExitCode {
     // distro (--distro) is for development and skips it.
     let setup = !std::env::args().any(|a| a == "--distro") && setup::needed();
     serve::set_setup_pending(setup);
-    if let Err(e) = serve::start(cfg.clone()) {
+    // A kiri-win stopped just before this one started can still hold the
+    // pipe for a moment (handover.rs): wait for it, unless a Kiri that
+    // answers its window serves it.
+    let started = handover::start_when_free(
+        || serve::start(cfg.clone()),
+        || win::window_answers(app::CLASS.0),
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_millis(250),
+    );
+    if let Err(e) = started {
         // Another kiri-win already serves the pipe: show its window instead.
         if app::running() {
             if !background {
