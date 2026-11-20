@@ -15,6 +15,17 @@ pub fn path() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("HOME is not set"))
 }
 
+/// The agent's last `kiri-init: ` line since the console was last opened
+/// (`capture` heads each boot's lines): why it stopped, when it did.
+pub fn agent_error(path: &Path) -> Option<String> {
+    let text = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&text);
+    let boot = text.rsplit_once(HEADER).map_or(&*text, |(_, b)| b);
+    boot.lines().rev().find_map(|l| l.split_once("kiri-init: ")).map(|(_, why)| why.trim().to_owned())
+}
+
+const HEADER: &str = "=== guest console ===";
+
 pub fn capture(path: &Path) -> io::Result<OwnedFd> {
     let (fd, _reader) = capture_to(path, MAX_FILE)?;
     Ok(fd)
@@ -24,7 +35,7 @@ fn capture_to(
     path: &Path,
     max: u64,
 ) -> io::Result<(OwnedFd, std::thread::JoinHandle<io::Result<()>>)> {
-    super::append_to(path, "=== guest console ===", max)?;
+    super::append_to(path, HEADER, max)?;
     let (reader, writer) = UnixStream::pair()?;
     let path = path.to_owned();
     let thread = std::thread::Builder::new()
@@ -88,6 +99,19 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_agents_reason_comes_from_this_boot_only() {
+        let dir = std::env::temp_dir().join(format!("kiri-console-reason-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("guest-console.log");
+        std::fs::write(&path, format!("{HEADER}\nkiri-init: an older boot's error\n{HEADER}\nsome output\nkiri-init: stopping agent 7, left running by a daemon that is gone\nkiri-init: another Kiri engine is running on this machine\n")).unwrap();
+        assert_eq!(agent_error(&path).as_deref(), Some("another Kiri engine is running on this machine"));
+        std::fs::write(&path, format!("{HEADER}\nkiri-init: an older boot's error\n{HEADER}\nsome output\n")).unwrap();
+        assert_eq!(agent_error(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kiri-console-{name}-{}", std::process::id()));

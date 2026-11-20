@@ -192,19 +192,36 @@ fn take_over(root: &std::path::Path) -> io::Result<()> {
         let daemon = parent_of(old);
         let orphan = old > 0 && !daemon.is_some_and(is_daemon);
         let waited = start.elapsed();
+        // Only the processes that hold the lock are signalled, never `old`
+        // by its number alone: a dead agent's pid may be another process's
+        // by now.
         if orphan && signalled.is_none() {
             eprintln!("kiri-init: stopping agent {old}, left running by a daemon that is gone");
-            // SAFETY: signalling the process that holds our data directory's lock.
-            unsafe { libc::kill(old, libc::SIGTERM) };
+            for pid in lock_holders(&file) {
+                // The agent cleans up on SIGTERM. Any other holder is a child
+                // of it that never reached its execve (Kiri before 0.4.5): it
+                // kept every descriptor the agent had, this lock's too, waits
+                // on nothing that will come, and outlives the agent. Left
+                // alone it kept every later agent from starting.
+                let sig = if pid == old { libc::SIGTERM } else { libc::SIGKILL };
+                // SAFETY: signalling a process that holds our data directory's lock.
+                unsafe { libc::kill(pid, sig) };
+            }
             signalled = Some(waited);
         } else if orphan && signalled.is_some_and(|t| waited - t > std::time::Duration::from_secs(5)) {
-            // SAFETY: as above; it did not stop on SIGTERM.
-            unsafe { libc::kill(old, libc::SIGKILL) };
+            for pid in lock_holders(&file) {
+                // SAFETY: as above; it did not stop on SIGTERM.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
         }
         if waited > std::time::Duration::from_secs(8) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
-                format!("another Kiri engine is running on this machine (agent {old}, daemon {}): stop it first", daemon.unwrap_or(0)),
+                format!(
+                    "another Kiri engine is running on this machine (agent {old}, daemon {}, lock held by {:?}): stop it first",
+                    daemon.unwrap_or(0),
+                    lock_holders(&file)
+                ),
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -214,6 +231,24 @@ fn take_over(root: &std::path::Path) -> io::Result<()> {
     file.write_all_at(format!("{}\n", std::process::id()).as_bytes(), 0)?;
     let _ = AGENT_LOCK.set(file);
     Ok(())
+}
+
+/// The other processes that have `file` open, from /proc/<pid>/fd.
+fn lock_holders(file: &File) -> Vec<libc::pid_t> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(lock) = file.metadata() else { return Vec::new() };
+    let own = std::process::id() as libc::pid_t;
+    let Ok(procs) = std::fs::read_dir("/proc") else { return Vec::new() };
+    procs
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .filter(|&pid| pid != own)
+        .filter(|pid| {
+            std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|fds| {
+                fds.flatten().any(|fd| std::fs::metadata(fd.path()).is_ok_and(|m| m.dev() == lock.dev() && m.ino() == lock.ino()))
+            })
+        })
+        .collect()
 }
 
 /// A live process's parent, from /proc/<pid>/stat.
@@ -447,5 +482,51 @@ fn power_off() -> ! {
     loop {
         // SAFETY: pause takes no arguments.
         unsafe { libc::pause() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsRawFd;
+
+    /// An agent gone without its daemon (a Kiri upgrade), whose children
+    /// that never reached their execve still hold its lock: the next agent
+    /// stops them and starts, rather than failing every 8 seconds.
+    #[test]
+    fn a_dead_agents_children_holding_its_lock_give_way() {
+        let root = std::env::temp_dir().join(format!("kiri-take-over-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // SAFETY: a child that exits at once; its pid is then free.
+        let dead = match unsafe { libc::fork() } {
+            0 => unsafe { libc::_exit(0) },
+            pid => pid,
+        };
+        // SAFETY: reaping the child just forked.
+        unsafe { libc::waitpid(dead, std::ptr::null_mut(), 0) };
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(root.join("agent.lock")).unwrap();
+        std::fs::write(root.join("agent.lock"), format!("{dead}\n")).unwrap();
+        // SAFETY: flock on a descriptor we own.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        // SAFETY: the child only waits for a signal.
+        let child = match unsafe { libc::fork() } {
+            0 => loop {
+                unsafe { libc::pause() };
+            },
+            pid => pid,
+        };
+        drop(lock);
+
+        let started = std::time::Instant::now();
+        let taken = super::take_over(&root);
+        let mut status = 0;
+        // SAFETY: reaping the child forked above (killed by take_over, or here).
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, &mut status, 0);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        taken.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
     }
 }
