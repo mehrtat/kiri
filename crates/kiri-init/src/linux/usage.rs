@@ -3,12 +3,87 @@
 //! `du -x` counts it (allocated blocks, hard links once, never across into
 //! another filesystem such as a host folder or NFS export mounted on a
 //! volume). Walking tens of gigabytes takes a while, so the agent runs this
-//! on a thread of its own.
+//! in a child process of its own (`Measuring`), never on a thread: the agent
+//! must stay single-threaded for clone3, and a container or exec cloned
+//! while a thread held the allocator's lock waited on it forever, before
+//! its execve.
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+
+use super::sys;
+
+/// A measurement under way in a child process, whose lines come back
+/// through a pipe the agent polls.
+pub struct Measuring {
+    // The agent reaps it with every other child; the tests wait for it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pid: libc::pid_t,
+    from: OwnedFd,
+    got: Vec<u8>,
+}
+
+impl Measuring {
+    /// Forks the child that runs `measure`. The caller must be
+    /// single-threaded, as with any fork.
+    pub fn start(layers: &Path, containers: &Path, volumes: &Path) -> io::Result<Self> {
+        let (from, to) = sys::pipe()?;
+        // SAFETY: the agent is single-threaded, so the child is a consistent
+        // copy. It only walks the disk, writes to the pipe, then exits.
+        match unsafe { libc::fork() } {
+            0 => {
+                // A walk can take minutes: none of the agent's descriptors
+                // (a network's DNS socket) may stay open in it meanwhile.
+                sys::close_now(&sys::close_ranges(&[to.as_raw_fd()]));
+                let lines = measure(layers, containers, volumes);
+                let mut out = fs::File::from(to);
+                let code = i32::from(out.write_all(lines.join("\n").as_bytes()).is_err());
+                // SAFETY: leaving the child without running the parent's destructors.
+                unsafe { libc::_exit(code) }
+            }
+            pid if pid < 0 => Err(io::Error::last_os_error()),
+            pid => {
+                drop(to);
+                sys::set_nonblocking(from.as_raw_fd())?;
+                Ok(Measuring { pid, from, got: Vec::new() })
+            }
+        }
+    }
+
+    pub fn fd(&self) -> i32 {
+        self.from.as_raw_fd()
+    }
+
+    #[cfg(test)]
+    pub fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    /// Reads what the child wrote so far: the lines once it is done (the
+    /// pipe closed), None while it still runs. The agent reaps the child
+    /// like any other.
+    pub fn read(&mut self) -> Option<Vec<String>> {
+        let mut buf = [0u8; 16 << 10];
+        loop {
+            // SAFETY: reading into a buffer we own from a descriptor we own.
+            let n = unsafe { libc::read(self.from.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                self.got.extend_from_slice(&buf[..n as usize]);
+                continue;
+            }
+            match (n < 0).then(|| io::Error::last_os_error().kind()) {
+                Some(io::ErrorKind::Interrupted) => {}
+                Some(io::ErrorKind::WouldBlock) => return None,
+                _ => break,
+            }
+        }
+        Some(String::from_utf8_lossy(&self.got).lines().map(str::to_owned).collect())
+    }
+}
 
 /// One `KIND NAME BYTES` line per entry (see `kiri_proto::Msg::Usage`).
 pub fn measure(layers: &Path, containers: &Path, volumes: &Path) -> Vec<String> {
@@ -98,6 +173,14 @@ mod tests {
         assert!(size("c", "c1") < 64 << 10);
         let v = size("v", "data");
         assert!((256 << 10..512 << 10).contains(&v), "the hard link was counted twice, or the symlink followed: {v}");
+
+        // The agent's way: the same lines, from a child process.
+        let mut m = Measuring::start(&layers, &containers, &volumes).unwrap();
+        let mut status = 0;
+        // SAFETY: waiting for the child we just forked.
+        assert_eq!(unsafe { libc::waitpid(m.pid(), &mut status, 0) }, m.pid(), "the measurement is not a child process");
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "status {status}");
+        assert_eq!(m.read(), Some(lines));
         let _ = fs::remove_dir_all(&root);
     }
 }
