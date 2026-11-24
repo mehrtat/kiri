@@ -16,6 +16,7 @@ mod domains;
 mod engine;
 mod filters;
 mod health;
+mod hostdisk;
 mod hostetc;
 mod hostopts;
 mod mirror;
@@ -114,6 +115,15 @@ fn raise_open_files() {
 pub fn run(_args: &[String]) -> io::Result<()> {
     let t0 = Instant::now();
     raise_open_files();
+    // In WSL a crash's core goes to Windows' %TEMP%\wsl-crashes, on the
+    // drive that may hold the distro's disk: one of this daemon was 16 GB,
+    // written to a drive already full. None is written for it.
+    #[cfg(target_os = "linux")]
+    if binds::wsl().is_some() {
+        // SAFETY: a plain prctl on this process; programs it runs are
+        // dumpable again after their exec.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    }
     // SIGINT/SIGTERM shut down cleanly: power the guest off, remove the socket.
     // Blocked before anything else starts a thread, so every thread inherits
     // it and one thread waits for them. A thread started before this (the
