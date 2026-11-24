@@ -15,5 +15,11 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 
+[dev-dependencies]
+# Tests serve TLS on localhost with a self-signed certificate, as an
+# insecure registry does. Both crates are already in the workspace.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
 [lints]
 workspace = true

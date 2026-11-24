@@ -20,6 +20,12 @@ SOCK=/var/lib/kiri-daemon/.kiri/run
 W=${W:-kiri-wsl}
 $D rm -f $W $W-cli >/dev/null 2>&1
 $D volume rm $W-run $W-lib $W-store >/dev/null 2>&1
+# Images come from KIRI_TEST_REGISTRY (tests/lib/images.sh), never from Docker
+# Hub: here ubuntu (for $PLATFORM) and alpine, in the engine under test once it answers.
+# shellcheck source=SCRIPTDIR/lib/images.sh
+. "$(dirname "$0")/lib/images.sh"
+kiri_seed_images --platform $PLATFORM ubuntu:24.04 || echo "wsl: ubuntu:24.04 ($PLATFORM) could not be fetched"
+kiri_seed_images alpine:latest || echo "wsl: alpine could not be fetched"
 # WSL's disk is ext4; this container's own root is overlayfs, which can't be
 # an overlay's upper layer, so Kiri's state goes on volumes, as in
 # linux-host.sh.
@@ -32,6 +38,9 @@ $D cp "$DIR/install.sh" $W:/tmp/kiri-windows/install.sh >/dev/null
 $D exec $W sh -c 'cd /tmp/kiri-windows && sh ./install.sh'
 $D run -d --name $W-cli --network container:$W -v $W-run:/kiri alpine sh -c 'apk add -q docker-cli curl >/dev/null 2>&1; sleep infinity' >/dev/null
 for _ in $(seq 90); do $D exec $W-cli docker -H unix:///kiri/docker.sock version >/dev/null 2>&1 && break; sleep 1; done
+$D cp "$(dirname "$0")/lib/images.sh" $W-cli:/images.sh >/dev/null
+$D exec -e KIRI_TEST_REGISTRY="$KIRI_REG" $W-cli sh -c '. /images.sh; export DOCKER_HOST=unix:///kiri/docker.sock; kiri_seed_images $KIRI_IMAGES_WSL' ||
+  echo "wsl: an image could not be fetched; the checks that run it will fail"
 PASS=0; FAIL=0
 t() {
   local name=$1 want=$2; shift 2
@@ -47,9 +56,10 @@ t internet "Example Domain" "docker run --rm alpine wget -qO- -T 10 http://examp
 t port "Welcome to nginx" "docker run -d --name web -p 18082:80 nginx:alpine >/dev/null; for i in \$(seq 40); do curl -s localhost:18082 && break; sleep 0.5; done"
 t exec "nginx version" "docker exec web nginx -v"
 t port-inspect '{"80/tcp":[{"HostIp":"","HostPort":"18082"}]}' "docker inspect -f '{{json .HostConfig.PortBindings}}' web"
-# What the registry serves now, for update checkers (#257).
-t distribution '"mediaType":"application/vnd.oci.image.index.v1+json"' "curl -s --unix-socket /kiri/docker.sock http://d/v1.47/distribution/library/alpine:3.21/json"
-t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-socket /kiri/docker.sock http://d/v1.47/distribution/library/no-such-image-kiri-test/json"
+# What the registry serves now, for update checkers (#257). Asked of
+# KIRI_TEST_REGISTRY, which serves Docker Hub's official images as they are.
+t distribution '"mediaType":"application/vnd.oci.image.index.v1+json"' "curl -s --unix-socket /kiri/docker.sock http://d/v1.47/distribution/$KIRI_REG/alpine:3.21/json"
+t distribution-missing "404" "curl -s -o /dev/null -w '%{http_code}' --unix-socket /kiri/docker.sock http://d/v1.47/distribution/$KIRI_REG/no-such-image-kiri-test/json"
 # A copy into a created container, then its start, mounts the same upper
 # dir twice in a row: kernels with overlayfs index on (Arch) refused the
 # second with EBUSY (#227). A renamed directory must survive a commit.
@@ -69,7 +79,7 @@ t volume-user-ready "passed passed passed" "docker run --name ready-seed alpine 
 # container joining its network sent meanwhile all finish, and a start that
 # fails during the fill is still a start error with a whole volume
 # (tests/start-stall.sh).
-$D cp "$(dirname "$0")/start-stall.sh" kiri-wsl-cli:/start-stall.sh >/dev/null
+$D cp "$(dirname "$0")/start-stall.sh" $W-cli:/start-stall.sh >/dev/null
 t start-stall-exec "pass:" "sh /start-stall.sh"
 t seccomp "Seccomp:	2" "docker run --rm alpine grep Seccomp: /proc/self/status"
 t cleanup "web" "docker rm -f web db"
@@ -135,6 +145,26 @@ t cj-run-after-restart "ran" "docker run --rm alpine true && echo ran"
 cj cj-next-start-deletes-nothing "kept 2" "$CJ_KEPT"
 t cj-cleanup "done" "docker rm -f cj1 cj2 >/dev/null 2>&1; docker volume rm -f cjv1 cjv2 >/dev/null 2>&1; echo done"
 in_wsl "for id in $CJ_IDS; do rm -rf $ST/containers/\$id /var/lib/kiri/containers/\$id; done; rm -f $ST/containers.json.corrupt-*" >/dev/null
+# Docker's insecure-registries and registry-mirrors in the engine's own
+# ~/.kiri/daemon.json (#329, #611, #118), set through `kiri registry` in the
+# distro, where kiri-win.exe runs the CLI: a plain-HTTP registry at this
+# distro's address (not loopback) is refused until listed, then pulled from
+# and pushed to; a Docker Hub image only a plain-HTTP mirror has pulls
+# through the mirror.
+RIP=$(in_wsl "hostname -I | cut -d' ' -f1" | tr -d '\r ')
+KR="HOME=/var/lib/kiri-daemon /usr/local/bin/kiri registry"
+t insecure-setup "ok" "docker rm -f kiri-reg >/dev/null 2>&1; docker run -d --name kiri-reg -p 5055:5000 registry:2 >/dev/null; for i in \$(seq 60); do curl -s -o /dev/null localhost:5055/v2/ && break; sleep 0.25; done; for r in team/alp:1 library/kiri-mirror-only:1; do docker tag alpine localhost:5055/\$r && docker push -q localhost:5055/\$r >/dev/null && docker rmi localhost:5055/\$r >/dev/null || exit; done; echo ok"
+t insecure-http-unlisted-refused "refused" "docker pull $RIP:5055/team/alp:1 >/dev/null 2>&1 && echo pulled || echo refused"
+cj insecure-cli-add "$RIP:5055" "$KR insecure add $RIP:5055"
+t insecure-http-pull "Downloaded newer image" "docker pull $RIP:5055/team/alp:1 2>&1"
+t insecure-http-push "pushed" "docker tag alpine $RIP:5055/team/pushed:1 && docker push $RIP:5055/team/pushed:1 >/dev/null 2>&1 && curl -s localhost:5055/v2/team/pushed/tags/list | grep -q '\"1\"' && echo pushed"
+cj insecure-cli-remove "no insecure registries" "$KR insecure remove $RIP:5055"
+t insecure-removed-refused "refused" "docker rmi $RIP:5055/team/alp:1 >/dev/null 2>&1; docker pull $RIP:5055/team/alp:1 >/dev/null 2>&1 && echo pulled || echo refused"
+cj mirror-cli-add "http://$RIP:5055" "$KR insecure add $RIP:5055 >/dev/null; $KR mirror add http://$RIP:5055"
+t mirror-http-pull "Downloaded newer image" "docker pull kiri-mirror-only:1 2>&1"
+t mirror-docker-info "http://$RIP:5055/" "docker info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
+cj insecure-cleanup "no registry mirrors" "$KR mirror remove http://$RIP:5055; rm -f /var/lib/kiri-daemon/.kiri/daemon.json"
+t insecure-cleanup-reg "done" "docker rm -f kiri-reg >/dev/null 2>&1; echo done"
 $D rm -f $W $W-cli >/dev/null
 $D volume rm $W-run $W-lib $W-store >/dev/null 2>&1
 echo "$PASS passed, $FAIL failed"

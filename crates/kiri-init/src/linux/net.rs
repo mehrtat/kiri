@@ -6,6 +6,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+use super::firewall;
 use super::netlink::{self, Netlink};
 use super::sys;
 
@@ -15,6 +16,9 @@ pub const UPLINK: &str = "eth0";
 pub const HOST_ADDR: [u8; 4] = [198, 19, 248, 254];
 /// Where the redirect lands: the agent's listener for host-bound connections.
 pub const HOST_RELAY_PORT: u16 = 1026;
+/// Where outbound container TCP connections to VPN tunnel prefixes or under
+/// host egress land, to be relayed over vsock to the host dialer.
+pub const EGRESS_RELAY_PORT: u16 = 1038;
 /// Container interfaces stay below this, so any uplink MTU fits.
 const CONTAINER_MTU: u32 = 1500;
 
@@ -80,6 +84,67 @@ impl Plug {
     }
 }
 
+/// A network a container can reach the outside through: one that is not
+/// `--internal`, with the gateways it offers. Kept per running container, in
+/// the order its networks were plugged in, so that a disconnect can hand the
+/// default route on to the next one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uplink {
+    /// Host side of its veth, which names the attachment on a disconnect.
+    pub veth: String,
+    /// Its interface in the container: `eth0`, `eth1` …
+    pub ifname: String,
+    pub v4: Option<[u8; 4]>,
+    pub v6: Option<[u8; 16]>,
+}
+
+impl Uplink {
+    /// None for an internal network, which never gives a default route.
+    pub fn of(veth: &str, ifname: &str, gateway: [u8; 4], v6: Option<Ip6>, plug: Plug) -> Option<Uplink> {
+        let v4 = (!plug.internal && !plug.no_ipv4).then_some(gateway);
+        let v6 = v6.filter(|_| !plug.internal).map(|v| v.gateway);
+        (v4.is_some() || v6.is_some()).then(|| Uplink { veth: veth.to_owned(), ifname: ifname.to_owned(), v4, v6 })
+    }
+}
+
+/// The uplinks that hold the IPv4 and the IPv6 default route: for each, the
+/// first one plugged in that has it. `attach` adds every uplink's route and
+/// the kernel keeps the first (the later ones are EEXIST), so this is the
+/// same choice. Docker would take the network whose name sorts first among
+/// equals; keeping the first is steadier: plugging in a network never moves
+/// a running container's traffic.
+pub fn route_holders(uplinks: &[Uplink]) -> (Option<&Uplink>, Option<&Uplink>) {
+    (uplinks.iter().find(|u| u.v4.is_some()), uplinks.iter().find(|u| u.v6.is_some()))
+}
+
+/// Takes the attachment whose host veth is `veth` out of `uplinks`, after it
+/// was unplugged. If it held a default route, the next uplink gets it, as
+/// Docker moves the default gateway when a container leaves that network;
+/// with none left the container has no default route, as on internal-only
+/// networks. The kernel dropped the old route with the interface.
+pub fn hand_over_default_routes(pid: libc::pid_t, uplinks: &mut Vec<Uplink>, veth: &str) -> io::Result<()> {
+    let (old4, old6) = route_holders(uplinks);
+    let (was4, was6) = (old4.is_some_and(|u| u.veth == veth), old6.is_some_and(|u| u.veth == veth));
+    uplinks.retain(|u| u.veth != veth);
+    if !was4 && !was6 {
+        return Ok(());
+    }
+    let (new4, new6) = route_holders(uplinks);
+    let (new4, new6) = (new4.filter(|_| was4), new6.filter(|_| was6));
+    if new4.is_none() && new6.is_none() {
+        return Ok(());
+    }
+    let netns = std::fs::File::open(format!("/proc/{pid}/ns/net"))?;
+    let mut inner = Netlink::open_in(&netns)?;
+    if let Some(u) = new4 {
+        netlink::replace_default_route(&mut inner, netlink::index_in(&netns, &u.ifname)?, u.v4.unwrap_or_default())?;
+    }
+    if let Some(u) = new6 {
+        netlink::replace_default_route6(&mut inner, netlink::index_in(&netns, &u.ifname)?, u.v6.unwrap_or_default())?;
+    }
+    Ok(())
+}
+
 pub fn ip6_str(a: [u8; 16]) -> String {
     std::net::Ipv6Addr::from(a).to_string()
 }
@@ -125,7 +190,74 @@ pub fn host_uplink() -> io::Result<()> {
     // let containers reach the real machine's 127.0.0.1 services. host.docker
     // .internal maps to the bridge gateway instead (write_etc_files).
     let _ = HOST_UPLINK_INDEX.set(index);
+    let uplink6 = std::fs::read_to_string("/proc/net/ipv6_route").ok().and_then(|r| default_route6_iface(&r));
+    firewall::set_uplinks(iface.clone(), uplink6.unwrap_or(iface));
+    through_firewall(firewall::Why::Start);
     install_nat(Nat { uplink: index, redirect: false, dnat: Vec::new(), gateway: [0; 4] })
+}
+
+/// The interface of the IPv6 default route in /proc/net/ipv6_route (dest
+/// `::/0`), but not `lo`, which holds the unreachable default.
+fn default_route6_iface(routes: &str) -> Option<String> {
+    routes.lines().find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.len() == 10 && f[0].bytes().all(|b| b == b'0') && f[1] == "00" && f[9] != "lo").then(|| f[9].to_owned())
+    })
+}
+
+/// Linux host: a socket that hears of every nf_tables change, so a firewall
+/// started, reloaded or flushed after the engine (Docker's, ufw, firewalld,
+/// nftables.service) is brought in line at once. None if the kernel refuses it.
+pub fn firewall_events() -> Option<OwnedFd> {
+    netlink::nftables_events().inspect_err(|e| eprintln!("kiri-init: not watching the host's firewall: {e}")).ok()
+}
+
+/// `firewall_events` heard of a change: reads it and brings the host's
+/// firewall, and Kiri's own tables, in line.
+pub fn firewall_changed(events: &OwnedFd) {
+    netlink::drain(events);
+    through_firewall(firewall::Why::Event);
+}
+
+/// `firewall::sync`, with Kiri's own tables built again as last built when
+/// it asks: a flush of the whole ruleset (`nft flush ruleset`, as
+/// nftables.service runs it) took them, and containers had no masquerade,
+/// no published ports and no forward filter keeping the LAN off their
+/// unpublished ports; or the forward chain's firewalld guard changed.
+fn through_firewall(why: firewall::Why) {
+    firewall::sync(why, |[v4, v6]| {
+        // Built before (`refresh_nat` takes the lock itself).
+        let built = NAT.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if v4
+            && built
+            && let Err(e) = refresh_nat()
+        {
+            eprintln!("kiri-init: NAT: {e}");
+        }
+        let nat6 = NAT6.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if v6
+            && !nat6.0.is_empty()
+            && let Err(e) = refresh_nat6(&nat6.0, &nat6.1)
+        {
+            eprintln!("kiri-init: IPv6 NAT: {e}");
+        }
+    });
+}
+
+/// What Kiri's IPv6 table was last built from (`install_nat6`), to build it
+/// again after a flush.
+#[allow(clippy::type_complexity)]
+static NAT6: std::sync::Mutex<(Vec<([u8; 16], u8)>, Vec<String>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
+
+/// Rebuilds Kiri's IPv6 table from `subnets`/`bridges` and, in the VM, the
+/// loopback redirect and input guard for `HOST_RELAY_PORT`.
+fn refresh_nat6(subnets: &[([u8; 16], u8)], bridges: &[String]) -> io::Result<()> {
+    let (redirect, dnat) = NAT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or((false, Vec::new()), |n| (n.redirect, n.dnat.clone()));
+    netlink::install_nat6(subnets, bridges, HOST_RELAY_PORT, redirect, &dnat)
 }
 
 /// What Kiri's IPv4 table was last built from, so it can be rebuilt when a
@@ -138,17 +270,91 @@ struct Nat {
 }
 
 static NAT: std::sync::Mutex<Option<Nat>> = std::sync::Mutex::new(None);
+/// Egress IPv4 CIDR prefixes redirected to `EGRESS_RELAY_PORT`.
+static EGRESS_ROUTES: std::sync::Mutex<Vec<([u8; 4], u8)>> = std::sync::Mutex::new(Vec::new());
+/// Active bridge IPv4 subnets `(name, network, prefix)`, exempt from egress redirect.
+static BRIDGE_SUBNETS: std::sync::Mutex<Vec<(String, [u8; 4], u8)>> = std::sync::Mutex::new(Vec::new());
+/// The VM uplink's IPv4 subnet `(network, prefix)`, exempt from egress redirect.
+static UPLINK_SUBNET: std::sync::Mutex<Option<([u8; 4], u8)>> = std::sync::Mutex::new(None);
 /// The kernel has no nft_fib_ipv4 (`fib daddr type local`): ports
 /// published on every address are matched per address of this machine.
 static NO_FIB4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+pub fn parse_cidr(s: &str) -> Option<([u8; 4], u8)> {
+    let (ip, prefix) = s.trim().split_once('/')?;
+    let ip = parse_ip(ip)?;
+    let prefix: u8 = prefix.parse().ok().filter(|&p| p <= 32)?;
+    Some((netlink::mask_ipv4(ip, prefix), prefix))
+}
+
+pub fn parse_egress_routes(list: kiri_proto::StrList<'_>) -> Vec<([u8; 4], u8)> {
+    let mut out = Vec::new();
+    for s in list.iter() {
+        if let Some(c) = parse_cidr(s)
+            && !out.contains(&c)
+        {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether `routes` includes full host egress (`0.0.0.0/0`), in which case
+/// guest upstream DNS lookups should go straight through the host DNS relay.
+pub fn egress_prefers_dns_relay(routes: &[([u8; 4], u8)]) -> bool {
+    routes.iter().any(|&(_, prefix)| prefix == 0)
+}
+
+/// Updates the IPv4 CIDR prefixes redirected to the host egress dialer and
+/// rebuilds Kiri's IPv4 nftables table.
+pub fn set_egress_routes(routes: Vec<([u8; 4], u8)>) -> io::Result<()> {
+    *EGRESS_ROUTES.lock().unwrap_or_else(|e| e.into_inner()) = routes;
+    refresh_nat()
+}
+
+fn egress_skip_subnets() -> Vec<([u8; 4], u8)> {
+    let mut skip = vec![
+        ([127, 0, 0, 0], 8),
+        ([169, 254, 0, 0], 16),
+        ([224, 0, 0, 0], 3),
+    ];
+    if let Some(up) = *UPLINK_SUBNET.lock().unwrap_or_else(|e| e.into_inner())
+        && !skip.contains(&up)
+    {
+        skip.push(up);
+    }
+    for &(_, net, prefix) in BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if !skip.contains(&(net, prefix)) {
+            skip.push((net, prefix));
+        }
+    }
+    skip
+}
+
 /// Builds Kiri's IPv4 table from `nat` and the bridges made so far, and
-/// keeps `nat` for `refresh_nat`.
+/// keeps `nat` for `refresh_nat`. In the VM (`nat.redirect`), also installs
+/// the IPv6 `::1` loopback redirect and input guard on a best-effort basis.
 fn install_nat(nat: Nat) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     let bridges = MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let egress = EGRESS_ROUTES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let skip = if egress.is_empty() { Vec::new() } else { egress_skip_subnets() };
     let any_addr = nat.dnat.iter().any(|d| d.host_ip == [0; 4]);
-    let install = |local: Option<&[[u8; 4]]>| netlink::install_nat_from(nat.uplink, HOST_ADDR, HOST_RELAY_PORT, nat.redirect, &nat.dnat, nat.gateway, &bridges, local);
+    let install = |local: Option<&[[u8; 4]]>| {
+        netlink::install_nat_with_egress(
+            nat.uplink,
+            HOST_ADDR,
+            HOST_RELAY_PORT,
+            nat.redirect,
+            &nat.dnat,
+            nat.gateway,
+            &bridges,
+            local,
+            EGRESS_RELAY_PORT,
+            &egress,
+            &skip,
+        )
+    };
     let r = if any_addr && NO_FIB4.load(Ordering::Relaxed) {
         install(Some(&local_addrs()))
     } else {
@@ -162,97 +368,14 @@ fn install_nat(nat: Nat) -> io::Result<()> {
         }
     };
     if r.is_ok() {
-        // A Linux host: its own firewall may drop what Kiri's table lets through.
-        if !nat.redirect {
-            open_host_forward();
-        }
+        let redirect = nat.redirect;
         *NAT.lock().unwrap_or_else(|e| e.into_inner()) = Some(nat);
+        if redirect {
+            let nat6 = NAT6.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let _ = refresh_nat6(&nat6.0, &nat6.1);
+        }
     }
     r
-}
-
-/// The iptables tools for IPv4 and IPv6, in the host's own backend (nft or
-/// legacy): Docker Engine, ufw and firewalld set their rules through them.
-const HOST_FIREWALLS: [&str; 2] = ["iptables", "ip6tables"];
-/// Marks the rules Kiri adds, so teardown removes only its own.
-const FORWARD_MARK: &str = "kiri";
-
-/// Where Kiri's bridges need an accept in the host's iptables filter table,
-/// from `iptables -S`: Docker's DOCKER-USER chain when there is one (Docker
-/// keeps it across its own restarts, and its FORWARD policy is DROP), else
-/// the top of FORWARD when its policy drops (ufw, firewalld), else nowhere.
-fn host_forward_chain(listing: &str) -> Option<&'static str> {
-    let lines = || listing.lines().map(str::trim);
-    if lines().any(|l| l == "-N DOCKER-USER") {
-        Some("DOCKER-USER")
-    } else if lines().any(|l| l == "-P FORWARD DROP") {
-        Some("FORWARD")
-    } else {
-        None
-    }
-}
-
-/// The two rules: from and to any Kiri bridge, accepted.
-fn host_forward_rules() -> [[&'static str; 8]; 2] {
-    let rule = |dir| [dir, "kiri+", "-m", "comment", "--comment", FORWARD_MARK, "-j", "ACCEPT"];
-    [rule("-i"), rule("-o")]
-}
-
-fn host_firewall(tool: &str, args: &[&str]) -> io::Result<std::process::Output> {
-    std::process::Command::new(tool).arg("-w").args(args).stdin(std::process::Stdio::null()).output()
-}
-
-/// On a Linux host, every forward hook must accept a packet: Kiri's own
-/// table accepting a container's traffic does not stop a host firewall's
-/// FORWARD chain with policy DROP (Docker Engine sets one, and keeps it
-/// after it stops) from dropping it, and containers then have no network.
-/// So Kiri's bridges get an accept there too; Kiri's own forward chain still
-/// keeps the LAN away from containers. Without iptables there is nothing
-/// to open.
-fn open_host_forward() {
-    open_host_forward_with(&HOST_FIREWALLS);
-}
-
-fn open_host_forward_with(tools: &[&str]) {
-    for &tool in tools {
-        let listing = match host_firewall(tool, &["-S"]) {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-            _ => continue,
-        };
-        let Some(chain) = host_forward_chain(&listing) else { continue };
-        for rule in host_forward_rules() {
-            let present = host_firewall(tool, &[&["-C", chain][..], &rule[..]].concat()).is_ok_and(|o| o.status.success());
-            if present {
-                continue;
-            }
-            match host_firewall(tool, &[&["-I", chain, "1"][..], &rule[..]].concat()) {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => eprintln!("kiri-init: {tool} -I {chain}: {}", String::from_utf8_lossy(&o.stderr).trim()),
-                Err(e) => eprintln!("kiri-init: {tool} -I {chain}: {e}"),
-            }
-        }
-    }
-}
-
-/// Removes the rules `open_host_forward` added, from either chain.
-fn close_host_forward() {
-    close_host_forward_with(&HOST_FIREWALLS);
-}
-
-fn close_host_forward_with(tools: &[&str]) {
-    for &tool in tools {
-        for chain in ["DOCKER-USER", "FORWARD"] {
-            for rule in host_forward_rules() {
-                let delete = [&["-D", chain][..], &rule[..]].concat();
-                // One -D removes one copy; a crash may have left several.
-                for _ in 0..16 {
-                    if !host_firewall(tool, &delete).is_ok_and(|o| o.status.success()) {
-                        break;
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Rebuilds Kiri's IPv4 table as last built, for the bridges there are now.
@@ -275,13 +398,43 @@ fn refresh_nat() -> io::Result<()> {
 /// DNS forwarder is (10.255.255.254, on `lo`). Containers on a bridge can't
 /// count on such a resolver: under WSL a third of the queries from a
 /// container's namespace go unanswered, while the host's own are fine. Their
-/// queries then go through the agent's resolver (127.0.0.11), which asks it
-/// from the host's side.
+/// queries then go through the agent's resolver, at the bridge's gateway
+/// (container.rs embedded_address), which asks it from the host's side.
 pub fn local_resolver(servers: &[[u8; 4]]) -> bool {
-    !servers.is_empty() && {
-        let local = local_addrs();
-        servers.iter().any(|s| local.contains(s))
+    !servers.is_empty() && local_resolver_among(servers, &local_addrs())
+}
+
+/// `local_resolver`, given this machine's addresses.
+pub fn local_resolver_among(servers: &[[u8; 4]], local: &[[u8; 4]]) -> bool {
+    servers.iter().any(|s| local.contains(s))
+}
+
+/// The IPv4 address of interface `name`, if it has one: a bridge's gateway.
+pub fn bridge_ipv4(name: &str) -> Option<[u8; 4]> {
+    if name.is_empty() || name.len() >= libc::IFNAMSIZ || name.contains('\0') {
+        return None;
     }
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: all-zero is a valid `ifreq`; `ifr_name` gets an ASCII name shorter than IFNAMSIZ.
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (dst, &src) in ifr.ifr_name.iter_mut().zip(name.as_bytes()) {
+        *dst = src as libc::c_char;
+    }
+    // SAFETY: `SIOCGIFADDR` fills `ifr_ifru.ifru_addr` with an `AF_INET` `sockaddr` for `ifr_name`.
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFADDR as _, &mut ifr) };
+    unsafe { libc::close(fd) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `SIOCGIFADDR` initialized `ifru_addr`; in `sockaddr_in`, `sa_data[2..6]` is `sin_addr`.
+    let addr = unsafe { ifr.ifr_ifru.ifru_addr };
+    (i32::from(addr.sa_family) == libc::AF_INET).then(|| {
+        let d = addr.sa_data;
+        [d[2] as u8, d[3] as u8, d[4] as u8, d[5] as u8]
+    })
 }
 
 /// This machine's IPv4 addresses but loopback, what `fib daddr type local`
@@ -448,6 +601,31 @@ impl Dhcp {
         Ok(())
     }
 
+    /// Configures `eth0` from host-supplied settings when DHCP did not answer.
+    /// No-op (`Ok(false)`) if a lease is already active.
+    pub fn apply_static(&mut self, ip: [u8; 4], prefix: u8, gateway: [u8; 4], dns: [u8; 4]) -> io::Result<bool> {
+        let index = self.index;
+        self.apply_static_with(ip, prefix, gateway, dns, |lease| {
+            let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
+            netlink::add_address(&mut nl, index, lease.ip, lease.prefix)?;
+            netlink::add_default_route(&mut nl, index, lease.gateway)
+        })
+    }
+
+    fn apply_static_with(&mut self, ip: [u8; 4], prefix: u8, gateway: [u8; 4], dns: [u8; 4], configure: impl FnOnce(&Lease) -> io::Result<()>) -> io::Result<bool> {
+        if self.lease.is_some() {
+            return Ok(false);
+        }
+        if !valid_uplink(ip, prefix, gateway) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid uplink settings"));
+        }
+        let lease = Lease { ip, prefix, gateway, dns: if dns == [0; 4] { Vec::new() } else { vec![dns] } };
+        configure(&lease)?;
+        self.state = DhcpState::Bound;
+        self.lease = Some(lease);
+        Ok(true)
+    }
+
     /// Handles a reply. Returns true once a lease has been configured.
     pub fn on_readable(&mut self) -> io::Result<bool> {
         let mut buf = [0u8; 1500];
@@ -492,6 +670,8 @@ impl Dhcp {
                     let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
                     netlink::add_address(&mut nl, self.index, lease.ip, lease.prefix)?;
                     netlink::add_default_route(&mut nl, self.index, lease.gateway)?;
+                    *UPLINK_SUBNET.lock().unwrap_or_else(|e| e.into_inner()) = Some((netlink::mask_ipv4(lease.ip, lease.prefix), lease.prefix));
+                    let _ = refresh_nat();
                     self.state = DhcpState::Bound;
                     self.lease = Some(lease);
                     return Ok(true);
@@ -506,6 +686,18 @@ impl Dhcp {
             }
         }
     }
+}
+
+fn valid_uplink(ip: [u8; 4], prefix: u8, gateway: [u8; 4]) -> bool {
+    if !(1..=30).contains(&prefix) || ip == [0; 4] || gateway == [0; 4] || ip == gateway {
+        return false;
+    }
+    if ip[0] == 127 || gateway[0] == 127 || ip[0] >= 224 || gateway[0] >= 224 {
+        return false;
+    }
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    let (ip_u, gw_u) = (u32::from_be_bytes(ip), u32::from_be_bytes(gateway));
+    (ip_u & mask) == (gw_u & mask) && (ip_u & !mask) != 0 && (ip_u & !mask) != !mask && (gw_u & !mask) != 0 && (gw_u & !mask) != !mask
 }
 
 fn random_u32() -> u32 {
@@ -551,21 +743,50 @@ pub struct Bridges {
     made: HashMap<String, (i32, Option<[u8; 4]>, u8, Bridge6)>,
 }
 
+/// What `Bridges::ensure` needs to do for a bridge given its cached state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgePlan {
+    /// Already up with everything asked for.
+    Reuse(i32),
+    /// Already up with the same IPv4 gateway/prefix; add IPv6 in place so
+    /// existing sockets and containers on the bridge are not disrupted.
+    AddV6(i32),
+    /// A different subnet took the bridge name: tear down and recreate.
+    Recreate,
+    /// Not created yet.
+    Create,
+}
+
 impl Bridges {
+    fn plan(&self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, want6: Bridge6) -> BridgePlan {
+        match self.made.get(name) {
+            Some(&(i, g, p, b6)) if (g, p) == (gateway, prefix) => match (b6, want6) {
+                (None, None) => BridgePlan::Reuse(i),
+                (None, Some(_)) => BridgePlan::AddV6(i),
+                // Already has IPv6 (e.g. a later container with IPv6 disabled,
+                // or a host-network caller that only needs IPv4): keep it.
+                (Some(_), None) => BridgePlan::Reuse(i),
+                (Some(a), Some(b)) if a == b => BridgePlan::Reuse(i),
+                (Some(_), Some(_)) => BridgePlan::Recreate,
+            },
+            Some(_) => BridgePlan::Recreate,
+            None => BridgePlan::Create,
+        }
+    }
+
     /// Creates the bridge (once) with its gateway address (and IPv6 one)
     /// and brings it up, with its rules in Kiri's tables. All or nothing: on
     /// an error the bridge is gone again and not recorded, so the next
     /// container tries afresh rather than starting with half the rules.
     pub fn ensure(&mut self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, v6: Option<Ip6>) -> io::Result<i32> {
         let want6 = v6.map(|v| (v.gateway, v.prefix));
-        match self.made.get(name) {
-            Some(&(i, g, p, b6)) if (g, p, b6) == (gateway, prefix, want6) => return Ok(i),
+        match self.plan(name, gateway, prefix, want6) {
+            BridgePlan::Reuse(i) => return Ok(i),
+            BridgePlan::AddV6(i) => return self.add_v6(name, i, gateway, prefix, v6.expect("AddV6 requires v6")),
             // The network was removed and its bridge name reused for one
             // with another subnet: start the bridge afresh.
-            Some(_) => {
-                self.remove(name);
-            }
-            None => {}
+            BridgePlan::Recreate => self.remove(name),
+            BridgePlan::Create => {}
         }
         let r = self.bring_up(name, gateway, prefix, v6);
         if r.is_err() {
@@ -573,6 +794,7 @@ impl Bridges {
                 let _ = netlink::delete_link(&mut nl, name);
             }
             MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m != name);
+            BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(m, ..)| m != name);
             let had6 = matches!(self.made.remove(name), Some((.., Some(_))));
             let _ = refresh_nat();
             if had6 {
@@ -580,6 +802,17 @@ impl Bridges {
             }
         }
         r
+    }
+
+    fn add_v6(&mut self, name: &str, index: i32, gateway: Option<[u8; 4]>, prefix: u8, v: Ip6) -> io::Result<i32> {
+        let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
+        netlink::add_address6(&mut nl, index, v.gateway, v.prefix)?;
+        self.made.insert(name.to_owned(), (index, gateway, prefix, Some((v.gateway, v.prefix))));
+        if let Err(e) = self.update_v6(Some(v)) {
+            self.made.insert(name.to_owned(), (index, gateway, prefix, None));
+            return Err(e);
+        }
+        Ok(index)
     }
 
     fn bring_up(&mut self, name: &str, gateway: Option<[u8; 4]>, prefix: u8, v6: Option<Ip6>) -> io::Result<i32> {
@@ -590,6 +823,13 @@ impl Bridges {
             made.push(name.to_owned());
         }
         drop(made);
+        {
+            let mut subs = BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner());
+            subs.retain(|(m, ..)| m != name);
+            if let Some(g) = gateway {
+                subs.push((name.to_owned(), netlink::mask_ipv4(g, prefix), prefix));
+            }
+        }
         let index = netlink::index_of(name)?;
         if let Some(g) = gateway {
             netlink::add_address(&mut nl, index, g, prefix)?;
@@ -603,6 +843,9 @@ impl Bridges {
             // DNATed from 127.0.0.1, so the bridge needs no `route_localnet`;
             // an older engine set it on bridges that may still exist.
             let _ = sys::write_file(&format!("/proc/sys/net/ipv4/conf/{name}/route_localnet"), "0");
+            // A firewall started after the engine, in iptables-legacy
+            // (which makes no nf_tables event) too.
+            through_firewall(firewall::Why::Bridge);
         }
         // The forward filter's rule for this bridge.
         refresh_nat()?;
@@ -620,6 +863,7 @@ impl Bridges {
             let _ = netlink::delete_link(&mut nl, name);
         }
         MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m != name);
+        BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(m, ..)| m != name);
         if let Err(e) = refresh_nat() {
             eprintln!("kiri-init: NAT: {e}");
         }
@@ -645,7 +889,10 @@ impl Bridges {
         if added.is_some() {
             ipv6_forwarding(true)?;
         }
-        let r = netlink::install_nat6(&subnets, &names);
+        let r = refresh_nat6(&subnets, &names);
+        if r.is_ok() {
+            *NAT6.lock().unwrap_or_else(|e| e.into_inner()) = (subnets.clone(), names.clone());
+        }
         if subnets.is_empty() {
             let _ = ipv6_forwarding(false);
         }
@@ -705,6 +952,8 @@ static MADE_BRIDGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::
 /// nftables table, so nothing of the engine is left in the host's network.
 pub fn remove_host_network() {
     let names = std::mem::take(&mut *MADE_BRIDGES.lock().unwrap_or_else(|e| e.into_inner()));
+    BRIDGE_SUBNETS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    EGRESS_ROUTES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     if let Ok(mut nl) = Netlink::open(libc::NETLINK_ROUTE) {
         for name in names {
             let _ = netlink::delete_link(&mut nl, &name);
@@ -713,9 +962,9 @@ pub fn remove_host_network() {
     if let Err(e) = netlink::remove_nat() {
         eprintln!("kiri-init: removing the nftables table: {e}");
     }
-    let _ = netlink::install_nat6(&[], &[]);
+    let _ = netlink::install_nat6(&[], &[], HOST_RELAY_PORT, false, &[]);
     let _ = ipv6_forwarding(false);
-    close_host_forward();
+    through_firewall(firewall::Why::Stop);
 }
 
 /// Gives a freshly cloned container its network: a veth pair whose peer
@@ -737,11 +986,13 @@ pub fn attach_container(
     attach(bridges, bridge, host_ifname, pid, 0, ip, prefix, gateway, mac, v6, plug)
 }
 
-/// Plugs the container into `bridge` as `eth{n}`. Only `eth0` gets the
-/// default route; more networks add their subnets, as with Docker. The
-/// first network with IPv6 gives the IPv6 default route. An `internal`
-/// network gives no default route at all, so traffic beyond it fails at
-/// once (unreachable), as with Docker. On a network without IPv6 the
+/// Plugs the container into `bridge` as `eth{n}`. The first non-internal
+/// network with IPv4 gives the IPv4 default route, even when it is not
+/// `eth0` (an internal network first, an outside one second); later ones
+/// keep it, and only add their subnets. The same goes for IPv6. An
+/// `internal` network never gives a default route, so traffic beyond it
+/// fails at once (unreachable), as with Docker. `hand_over_default_routes`
+/// moves a route on when its network is disconnected. On a network without IPv6 the
 /// interface has IPv6 off (no link-local address), as Docker does. On an
 /// IPv6-only network `ip` is only the name the container is kept by (its
 /// MAC is made from it): neither the interface nor the bridge gets it.
@@ -772,7 +1023,7 @@ pub fn attach(bridges: &mut Bridges, bridge: &str, host_ifname: &str, pid: libc:
         netlink::add_address6(&mut inner, index, v.ip, v.prefix)?;
     }
     netlink::set_up(&mut inner, index)?;
-    if n == 0 && !internal && !no_ipv4 {
+    if !internal && !no_ipv4 {
         netlink::add_default_route(&mut inner, index, gateway)?;
     }
     if let Some(v) = v6.filter(|_| !internal) {
@@ -835,55 +1086,6 @@ pub fn route(dst: [u8; 4], prefix: u8, via: [u8; 4], add: bool) -> io::Result<()
 mod tests {
     use super::*;
 
-    /// `iptables -S` on a host where Docker Engine ran (it stays after
-    /// Docker stops), with ufw, and with neither.
-    const DOCKER: &str = "-P INPUT ACCEPT\n-P FORWARD DROP\n-P OUTPUT ACCEPT\n-N DOCKER\n-N DOCKER-FORWARD\n-N DOCKER-USER\n-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n";
-    const UFW: &str = "-P INPUT DROP\n-P FORWARD DROP\n-P OUTPUT ACCEPT\n-N ufw-before-forward\n-A FORWARD -j ufw-before-forward\n";
-    const OPEN: &str = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n";
-
-    #[test]
-    fn a_host_firewall_that_drops_forwarding_gets_kiris_accept_in_the_right_chain() {
-        assert_eq!(host_forward_chain(DOCKER), Some("DOCKER-USER"));
-        assert_eq!(host_forward_chain(UFW), Some("FORWARD"));
-        assert_eq!(host_forward_chain(OPEN), None);
-        assert_eq!(host_forward_rules()[0], ["-i", "kiri+", "-m", "comment", "--comment", "kiri", "-j", "ACCEPT"]);
-        assert_eq!(host_forward_rules()[1][..2], ["-o", "kiri+"]);
-    }
-
-    /// A stand-in iptables: `-S` prints `listing`, the chain's rules live in
-    /// a file, -C/-I/-D act on it, and every call is logged.
-    fn fake_iptables(dir: &std::path::Path, listing: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
-        let tool = dir.join("iptables");
-        let script = format!(
-            "#!/bin/sh\nd={d}\nshift\necho \"$*\" >> $d/calls\ncase \"$1\" in\n-S) printf '%s' '{listing}' ;;\n-C) shift 2; grep -qxF -- \"$*\" $d/rules 2>/dev/null ;;\n-I) shift 3; echo \"$*\" >> $d/rules ;;\n-D) shift 2; grep -qxF -- \"$*\" $d/rules 2>/dev/null || exit 1; grep -vxF -- \"$*\" $d/rules > $d/r; mv $d/r $d/rules ;;\nesac\n",
-            d = dir.display()
-        );
-        std::fs::write(&tool, script).unwrap();
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        tool.to_string_lossy().into_owned()
-    }
-
-    #[test]
-    fn kiris_forward_accept_is_added_once_and_removed_at_teardown() {
-        let dir = std::env::temp_dir().join(format!("kiri-hostfw-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let tool = fake_iptables(&dir, DOCKER);
-        open_host_forward_with(&[&tool]);
-        // A bridge or a published port later rebuilds the table: no second copy.
-        open_host_forward_with(&[&tool]);
-        let rules = std::fs::read_to_string(dir.join("rules")).unwrap();
-        assert_eq!(rules.lines().collect::<Vec<_>>(), ["-i kiri+ -m comment --comment kiri -j ACCEPT", "-o kiri+ -m comment --comment kiri -j ACCEPT"]);
-        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
-        assert!(calls.lines().filter(|l| l.starts_with("-I")).all(|l| l.starts_with("-I DOCKER-USER 1 ")), "{calls}");
-        close_host_forward_with(&[&tool]);
-        assert_eq!(std::fs::read_to_string(dir.join("rules")).unwrap(), "");
-        // No iptables at all: nothing to do, and no panic.
-        open_host_forward_with(&[dir.join("missing").to_str().unwrap()]);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     #[test]
     fn ipv6_settings_come_from_the_options() {
         let mut buf = Vec::new();
@@ -898,5 +1100,116 @@ mod tests {
         kiri_proto::encode_net_attach::<&str>(&mut buf, "c1", "eth1", "kiri2", [10, 5, 0, 2], 24, [10, 5, 0, 1], &[], &[]);
         let Ok(kiri_proto::Msg::NetAttach { net, .. }) = kiri_proto::decode(&buf) else { panic!() };
         assert_eq!(Ip6::from_opts(net.opts), None);
+    }
+
+    #[test]
+    fn the_ipv6_uplink_is_the_default_routes_interface() {
+        let routes = "\
+fd00000000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000002 00000000 00000003    wlan0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
+";
+        assert_eq!(default_route6_iface(routes).as_deref(), Some("wlan0"));
+        // Only the unreachable default on lo: no IPv6 uplink.
+        assert_eq!(default_route6_iface(&routes.lines().skip(2).collect::<Vec<_>>().join("\n")), None);
+    }
+
+    fn up(veth: &str, v4: bool, v6: bool) -> Uplink {
+        Uplink { veth: veth.into(), ifname: veth.into(), v4: v4.then_some([10, 0, 0, 1]), v6: v6.then_some([0xfd; 16]) }
+    }
+
+    #[test]
+    fn internal_networks_are_no_uplink() {
+        let v6 = Some(Ip6 { ip: [0xfd; 16], prefix: 64, gateway: [0xfd; 16] });
+        assert_eq!(Uplink::of("kv1", "eth0", [10, 0, 0, 1], v6, Plug { internal: true, no_ipv4: false }), None);
+        let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], None, Plug::default()).unwrap();
+        assert_eq!((u.ifname.as_str(), u.v4, u.v6), ("eth1", Some([10, 0, 0, 1]), None));
+        let u = Uplink::of("kv1", "eth1", [10, 0, 0, 1], v6, Plug { internal: false, no_ipv4: true }).unwrap();
+        assert_eq!((u.v4, u.v6), (None, Some([0xfd; 16])));
+    }
+
+    #[test]
+    fn the_first_uplink_with_each_family_holds_its_default_route() {
+        let ups = [up("a", false, true), up("b", true, false), up("c", true, true)];
+        let (r4, r6) = route_holders(&ups);
+        assert_eq!((r4.map(|u| u.veth.as_str()), r6.map(|u| u.veth.as_str())), (Some("b"), Some("a")));
+        assert_eq!(route_holders(&[]), (None, None));
+    }
+
+    #[test]
+    fn a_disconnect_that_takes_no_default_route_touches_nothing() {
+        // The pid is never used: nothing to hand over, so no namespace is opened.
+        let mut ups = vec![up("a", true, true), up("b", true, true)];
+        hand_over_default_routes(-1, &mut ups, "b").unwrap();
+        assert_eq!(ups, [up("a", true, true)]);
+        hand_over_default_routes(-1, &mut ups, "a").unwrap();
+        assert!(ups.is_empty());
+    }
+
+    #[test]
+    fn bridge_ipv4_reads_an_interfaces_address() {
+        assert_eq!(bridge_ipv4("lo"), Some([127, 0, 0, 1]));
+        assert_eq!(bridge_ipv4("kiri-no-such-if"), None);
+    }
+
+    #[test]
+    fn bridges_ensure_is_idempotent_and_adds_ipv6_in_place() {
+        let gw4 = [172, 17, 0, 1];
+        let gw6 = [0xfd, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        let other6 = [0xfd, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1];
+        let v6 = Ip6 { ip: gw6, prefix: 64, gateway: gw6 };
+
+        let mut bridges = Bridges::default();
+        assert_eq!(bridges.plan("kiri0", Some(gw4), 16, None), BridgePlan::Create);
+
+        // Once kiri0 is brought up IPv4-only (e.g. by host-network DNS on a fresh VM),
+        // a repeat ensure reuses it without touching netlink, and a later IPv6 attach
+        // upgrades it in place rather than tearing it down.
+        bridges.made.insert("kiri0".into(), (42, Some(gw4), 16, None));
+        assert_eq!(bridges.ensure("kiri0", Some(gw4), 16, None).unwrap(), 42);
+        assert_eq!(bridges.plan("kiri0", Some(gw4), 16, Some((gw6, 64))), BridgePlan::AddV6(42));
+        assert_eq!(bridges.plan("kiri0", Some([172, 18, 0, 1]), 16, None), BridgePlan::Recreate);
+        assert_eq!(bridges.plan("kiri0", Some(gw4), 24, None), BridgePlan::Recreate);
+        assert_eq!(bridges.plan("kiri0", None, 16, Some((gw6, 64))), BridgePlan::Recreate);
+
+        // Once IPv6 is configured on kiri0, both matching IPv6 callers and IPv4-only
+        // callers reuse the existing bridge; a different IPv6 subnet recreates it.
+        bridges.made.insert("kiri0".into(), (42, Some(gw4), 16, Some((gw6, 64))));
+        assert_eq!(bridges.ensure("kiri0", Some(gw4), 16, Some(v6)).unwrap(), 42);
+        assert_eq!(bridges.ensure("kiri0", Some(gw4), 16, None).unwrap(), 42);
+        assert_eq!(bridges.plan("kiri0", Some(gw4), 16, Some((other6, 64))), BridgePlan::Recreate);
+    }
+
+    fn test_dhcp() -> Dhcp {
+        let (r, _w) = sys::pipe().unwrap();
+        Dhcp { sock: r, index: 2, mac: [2, 0, 0, 0, 0, 1], xid: 1, state: DhcpState::Discovering, next_send: Instant::now() + Duration::from_secs(1), attempt: 1, lease: None }
+    }
+
+    #[test]
+    fn set_uplink_applies_skips_when_leased_and_validates() {
+        let mut dhcp = test_dhcp();
+        for (ip, prefix, gw) in [
+            ([0; 4], 24, [192, 168, 64, 1]),
+            ([192, 168, 64, 2], 0, [192, 168, 64, 1]),
+            ([192, 168, 64, 2], 31, [192, 168, 64, 1]),
+            ([192, 168, 64, 2], 32, [192, 168, 64, 1]),
+            ([192, 168, 64, 2], 33, [192, 168, 64, 1]),
+            ([127, 0, 0, 2], 8, [127, 0, 0, 1]),
+            ([224, 0, 0, 2], 24, [224, 0, 0, 1]),
+            ([240, 0, 0, 2], 24, [240, 0, 0, 1]),
+            ([192, 168, 64, 1], 24, [192, 168, 64, 1]),
+            ([192, 168, 64, 255], 24, [192, 168, 64, 1]),
+            ([192, 168, 64, 0], 24, [192, 168, 64, 1]),
+            ([192, 168, 65, 2], 24, [192, 168, 64, 1]),
+        ] {
+            assert!(dhcp.apply_static_with(ip, prefix, gw, [0; 4], |_| panic!("must not configure")).is_err());
+        }
+        assert!(dhcp.apply_static_with([192, 168, 64, 2], 24, [192, 168, 64, 1], [192, 168, 64, 1], |_| Ok(())).unwrap());
+        assert_eq!(dhcp.timeout_ms(), -1);
+        let l = dhcp.lease.as_ref().unwrap();
+        assert_eq!((l.ip, l.prefix, l.gateway, l.dns.as_slice()), ([192, 168, 64, 2], 24, [192, 168, 64, 1], &[[192, 168, 64, 1]][..]));
+        // No-op when a lease (from DHCP or SetUplink) is already active.
+        assert!(!dhcp.apply_static_with([192, 168, 64, 9], 24, [192, 168, 64, 1], [0; 4], |_| panic!("must not reconfigure")).unwrap());
+        assert_eq!(dhcp.lease.as_ref().unwrap().ip, [192, 168, 64, 2]);
     }
 }

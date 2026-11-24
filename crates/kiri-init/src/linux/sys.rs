@@ -35,6 +35,70 @@ pub fn mount(src: &CStr, target: &CStr, fstype: &CStr, flags: libc::c_ulong, dat
     check(ret as _, &format!("mount {}", target.to_string_lossy())).map(drop)
 }
 
+/// Most of a page: the kernel copies mount options into one page and cuts
+/// the rest, so an overlay of many layers would lose its lowest ones.
+const MAX_OPTIONS: usize = 4000;
+
+/// An overlay of `lowers` (top first, each a folder path, relative to the
+/// working directory or absolute, with no `:` or `,`) at `target`, `rest`
+/// the options after the lower list (absolute paths). When the options do
+/// not fit in a page (some 60 layers by digest), the lowers are named by
+/// short links in a folder beside `target` and the mount is made from a
+/// child working in that folder: the same overlay, the agent's own working
+/// directory untouched (BuildKit's snapshotter does the same with short
+/// snapshot ids). The links go once the overlay holds its folders.
+pub fn mount_overlay(target: &Path, lowers: &[String], rest: &str, flags: libc::c_ulong) -> io::Result<()> {
+    let opts = format!("lowerdir={}{rest}", lowers.join(":"));
+    if opts.len() <= MAX_OPTIONS {
+        return mount(c"overlay", &cstr(target)?, c"overlay", flags, Some(&CString::new(opts)?));
+    }
+    let mut links = target.as_os_str().to_owned();
+    links.push(".lowers");
+    let links = std::path::PathBuf::from(links);
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(&links)?;
+    let here = std::env::current_dir()?;
+    for (i, l) in lowers.iter().enumerate() {
+        std::os::unix::fs::symlink(here.join(l), links.join(i.to_string()))?;
+    }
+    let short: Vec<String> = (0..lowers.len()).map(|i| i.to_string()).collect();
+    let opts = CString::new(format!("lowerdir={}{rest}", short.join(":")))?;
+    let dir = cstr(&links)?;
+    let target_c = cstr(target)?;
+    let result = (|| {
+        if opts.as_bytes().len() > MAX_OPTIONS {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} layers are more than one overlay can stack", lowers.len())));
+        }
+        // SAFETY: the child only calls chdir, mount and _exit, all
+        // async-signal-safe, on strings made before the fork.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: as above, in the child.
+            unsafe {
+                if libc::chdir(dir.as_ptr()) != 0 {
+                    libc::_exit(*libc::__errno_location());
+                }
+                let r = libc::mount(c"overlay".as_ptr(), target_c.as_ptr(), c"overlay".as_ptr(), flags, opts.as_ptr().cast());
+                libc::_exit(if r == 0 { 0 } else { *libc::__errno_location() });
+            }
+        }
+        check(pid as _, "fork")?;
+        let mut status = 0;
+        // SAFETY: waits for the child just made, into a local int.
+        check(unsafe { libc::waitpid(pid, &mut status, 0) } as _, "waitpid")?;
+        match (libc::WIFEXITED(status), libc::WEXITSTATUS(status)) {
+            (true, 0) => Ok(()),
+            (true, e) => {
+                let err = io::Error::from_raw_os_error(e);
+                Err(io::Error::new(err.kind(), format!("mount {}: {err}", target.display())))
+            }
+            _ => Err(io::Error::other(format!("mount {}: the mounting child died", target.display()))),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&links);
+    result
+}
+
 /// Mounts with no source or type, for changing propagation (`MS_PRIVATE` …).
 pub fn remount(target: &CStr, flags: libc::c_ulong) -> io::Result<()> {
     // SAFETY: `target` is a valid NUL-terminated string; the rest may be null.
@@ -46,6 +110,18 @@ pub fn umount_lazy(target: &Path) -> io::Result<()> {
     let t = cstr(target)?;
     // SAFETY: `t` is a valid NUL-terminated string.
     check(unsafe { libc::umount2(t.as_ptr(), libc::MNT_DETACH) } as _, "umount").map(drop)
+}
+
+/// Linux's `CGROUP2_SUPER_MAGIC` (`<linux/magic.h>`).
+const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+
+/// Whether `path` sits on a mounted `cgroup2` filesystem.
+pub fn is_cgroup2(path: &Path) -> bool {
+    let Ok(c) = cstr(path) else { return false };
+    // SAFETY: `st` is plain zero-initialized data; `c` is a valid C string.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statfs writes into `st`.
+    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == CGROUP2_SUPER_MAGIC }
 }
 
 pub fn mkdir(p: &CStr, mode: libc::mode_t) {
@@ -117,17 +193,77 @@ pub struct CloneArgs {
 
 pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
+/// A started child: its pid, and whether clone3 placed it in its cgroup.
+pub struct Cloned {
+    pub pid: libc::pid_t,
+    /// False when the child was started with clone(2): the caller must move
+    /// it into `CloneArgs::cgroup` itself before letting it run.
+    pub into_cgroup: bool,
+}
+
+/// Whether clone3 is unavailable rather than refusing this request: an old
+/// kernel answers ENOSYS, and a seccomp filter (Docker's and Android's) may
+/// answer ENOSYS or EPERM. glibc and runc fall back to clone(2) for these.
+fn clone3_unavailable(errno: Option<i32>) -> bool {
+    matches!(errno, Some(code) if code == libc::ENOSYS || code == libc::EPERM)
+}
+
+/// The clone(2) flags for `args`: clone3-only flags above 32 bits
+/// (CLONE_INTO_CGROUP, CLONE_CLEAR_SIGHAND) and fields clone(2) has no place
+/// for (the cgroup, a pidfd, set_tid, tls) are dropped, and clone3's separate
+/// exit signal goes back into the low byte of the flags. CLONE_NEWCGROUP
+/// goes too: clone3 places the child in its cgroup before making it, so the
+/// namespace is rooted there; clone(2) cannot, and a namespace made now
+/// would be rooted at the agent's cgroup. The caller unshares it after
+/// moving the child.
+fn clone_flags(args: &CloneArgs) -> libc::c_ulong {
+    ((args.flags & 0xffff_ffff & !(libc::CLONE_NEWCGROUP as u64)) | (args.exit_signal & 0xff)) as libc::c_ulong
+}
+
 /// Like fork(), but straight into new namespaces and a cgroup. Returns 0 in
 /// the child and the child's pid in the parent.
+///
+/// Uses clone3(2), which puts the child in its cgroup atomically. Where
+/// clone3 is blocked (an old kernel, or a seccomp filter answering ENOSYS or
+/// EPERM, as on Android/Droidspaces, #529), it falls back to clone(2), as
+/// glibc and runc do, and reports `into_cgroup: false`. clone(2) cannot make
+/// the cgroup namespace either, so the caller must move the child into its
+/// cgroup and unshare CLONE_NEWCGROUP before it proceeds.
 ///
 /// # Safety
 /// The caller must be single-threaded, as with fork(): the child gets a copy
 /// of this thread only, so no other thread may hold a lock it needs.
-pub unsafe fn clone3(args: &CloneArgs) -> io::Result<libc::pid_t> {
+pub unsafe fn clone3(args: &CloneArgs) -> io::Result<Cloned> {
     // SAFETY: `args` is a valid clone_args of the size passed; the caller
     // upholds the single-thread requirement.
     let ret = unsafe { libc::syscall(libc::SYS_clone3, args as *const CloneArgs, std::mem::size_of::<CloneArgs>()) };
-    check(ret, "clone3").map(|p| p as libc::pid_t)
+    if ret >= 0 {
+        return Ok(Cloned { pid: ret as libc::pid_t, into_cgroup: true });
+    }
+    let e = io::Error::last_os_error();
+    if !clone3_unavailable(e.raw_os_error()) {
+        return Err(io::Error::new(e.kind(), format!("clone3: {e}")));
+    }
+    // SAFETY: as above. clone(2) has no cgroup, pidfd, set_tid, stack or tls
+    // arguments here: the child runs on a copy of this thread's stack, like
+    // fork(). Passing 0 for the four arguments after `flags` is identical on
+    // x86_64 and aarch64 (CONFIG_CLONE_BACKWARDS). The caller upholds
+    // single-threadedness, which that requires.
+    let ret = unsafe {
+        libc::syscall(libc::SYS_clone, clone_flags(args), 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong)
+    };
+    if ret < 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("clone: {e}")));
+    }
+    Ok(Cloned { pid: ret as libc::pid_t, into_cgroup: false })
+}
+
+/// Makes this thread's namespace view like `unshare(2)`: a new cgroup
+/// namespace here is rooted at the caller's cgroup.
+pub fn unshare(flags: libc::c_int) -> io::Result<()> {
+    // SAFETY: plain syscall on the calling thread.
+    check(unsafe { libc::unshare(flags) } as _, "unshare").map(drop)
 }
 
 /// The engine's own message as one line of the container's log: a value
@@ -364,6 +500,34 @@ pub fn resize_pty(fd: RawFd, rows: u16, cols: u16) {
 mod tests {
     use std::io;
 
+    /// 131 layers by digest make options longer than a
+    /// page: the overlay still stacks them all, the lowest one included.
+    #[test]
+    fn an_overlay_of_more_layers_than_one_page_names() {
+        // SAFETY: a plain getter.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to mount");
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("kiri-many-lowers-{}", std::process::id()));
+        let layers = d.join("layers");
+        let mut lowers = Vec::new();
+        for i in 0..131 {
+            let name = format!("{i:064x}");
+            std::fs::create_dir_all(layers.join(&name)).unwrap();
+            std::fs::write(layers.join(&name).join(format!("f{i}")), b"x").unwrap();
+            lowers.insert(0, layers.join(&name).to_str().unwrap().to_owned());
+        }
+        let target = d.join("root");
+        std::fs::create_dir_all(&target).unwrap();
+        super::mount_overlay(&target, &lowers, ",index=off", libc::MS_RDONLY).unwrap();
+        let seen = target.join("f0").exists() && target.join("f130").exists();
+        let _ = super::umount_lazy(&target);
+        assert!(seen, "every layer is in the overlay");
+        assert!(!d.join("root.lowers").exists(), "the links are gone");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A value over several lines never starts a line of its own in the log.
     #[test]
     fn the_engines_message_is_one_line() {
@@ -463,5 +627,118 @@ mod tests {
         let err = io::Error::last_os_error();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(super::exec_failure(file.to_str().unwrap(), &err, super::Found { exists: true, dir: false }, false).0, 126, "{err}");
+    }
+
+    /// Only a clone3 that is blocked (a seccomp filter answering ENOSYS or
+    /// EPERM, as Docker's and Android's do, #529) falls back to clone(2);
+    /// a refusal of the request itself is reported as it is.
+    #[test]
+    fn only_a_blocked_clone3_falls_back() {
+        let f = super::clone3_unavailable;
+        assert!(f(Some(libc::ENOSYS)));
+        assert!(f(Some(libc::EPERM)));
+        for code in [libc::EINVAL, libc::EBUSY, libc::EAGAIN, libc::ENOMEM] {
+            assert!(!f(Some(code)), "errno {code}");
+        }
+        assert!(!f(None));
+    }
+
+    /// clone(2) cannot take CLONE_INTO_CGROUP (or any >32-bit clone3 flag such
+    /// as CLONE_CLEAR_SIGHAND), and a CLONE_NEWCGROUP made before the child is
+    /// in its cgroup would be rooted at the agent's, so all of those are
+    /// dropped; clone3's exit signal goes in the low byte, as clone(2) expects.
+    #[test]
+    fn clone2_flags_drop_what_it_cannot_place() {
+        const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+        let args = super::CloneArgs {
+            flags: (libc::CLONE_NEWPID | libc::CLONE_NEWCGROUP) as u64 | super::CLONE_INTO_CGROUP | CLONE_CLEAR_SIGHAND,
+            exit_signal: libc::SIGCHLD as u64,
+            ..Default::default()
+        };
+        let flags = super::clone_flags(&args) as u64;
+        assert_eq!(flags & libc::CLONE_NEWPID as u64, libc::CLONE_NEWPID as u64);
+        assert_eq!(flags & super::CLONE_INTO_CGROUP, 0);
+        assert_eq!(flags & CLONE_CLEAR_SIGHAND, 0);
+        assert_eq!(flags & libc::CLONE_NEWCGROUP as u64, 0);
+        assert_eq!(flags & 0xff, libc::SIGCHLD as u64);
+    }
+
+    /// The real thing: a seccomp filter answering ENOSYS or EPERM for clone3,
+    /// as Android's and Docker's do (#529), must fall back to clone(2) instead
+    /// of failing the start. The filter is installed in a child process of
+    /// this test binary, so it does not outlive the test.
+    #[test]
+    fn blocked_clone3_falls_back_to_clone() {
+        if let Some(val) = std::env::var_os("KIRI_CLONE3_SEccomp") {
+            let code = if val == "EPERM" { libc::EPERM } else { libc::ENOSYS };
+            install_clone3_denial(code);
+            // SAFETY: this helper process runs no other thread, as clone(2)
+            // without CLONE_VM needs; the child only calls _exit.
+            let cloned = unsafe {
+                super::clone3(&super::CloneArgs { exit_signal: libc::SIGCHLD as u64, ..Default::default() })
+            }
+            .expect("a blocked clone3 must fall back to clone");
+            assert!(!cloned.into_cgroup, "clone(2) cannot place the child in a cgroup");
+            if cloned.pid == 0 {
+                // SAFETY: _exit neither unwinds nor runs destructors.
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            // SAFETY: waiting for the child just cloned.
+            let waited = unsafe { libc::waitpid(cloned.pid, &mut status, 0) };
+            assert_eq!(waited, cloned.pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status}");
+            return;
+        }
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, m)| m);
+        let name = format!("{module}::blocked_clone3_falls_back_to_clone");
+        for kind in ["1", "EPERM"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env("KIRI_CLONE3_SEccomp", kind)
+                .output()
+                .expect("spawn this test binary");
+            assert!(
+                out.status.success(),
+                "the clone3-blocked helper ({kind}) failed:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// Installs a seccomp filter that makes clone3 return `errno`.
+    fn install_clone3_denial(errno: i32) {
+        #[repr(C)]
+        struct Insn {
+            code: u16,
+            jt: u8,
+            jf: u8,
+            k: u32,
+        }
+        #[repr(C)]
+        struct Prog {
+            len: u16,
+            filter: *const Insn,
+        }
+        const LD_W_ABS: u16 = 0x20;
+        const JEQ_K: u16 = 0x15;
+        const RET_K: u16 = 0x06;
+        const RET_ALLOW: u32 = 0x7fff_0000;
+        const RET_ERRNO: u32 = 0x0005_0000;
+        let insns = [
+            Insn { code: LD_W_ABS, jt: 0, jf: 0, k: 0 }, // seccomp_data.nr
+            Insn { code: JEQ_K, jt: 0, jf: 1, k: libc::SYS_clone3 as u32 },
+            Insn { code: RET_K, jt: 0, jf: 0, k: RET_ERRNO | errno as u32 },
+            Insn { code: RET_K, jt: 0, jf: 0, k: RET_ALLOW },
+        ];
+        let prog = Prog { len: insns.len() as u16, filter: insns.as_ptr() };
+        // SAFETY: valid prctl calls; `prog` lives until they return.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0, "no_new_privs: {}", io::Error::last_os_error());
+            let n = libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER as libc::c_ulong, &prog);
+            assert_eq!(n, 0, "seccomp: {}", io::Error::last_os_error());
+        }
     }
 }

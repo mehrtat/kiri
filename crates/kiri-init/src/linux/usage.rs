@@ -3,59 +3,82 @@
 //! `du -x` counts it (allocated blocks, hard links once, never across into
 //! another filesystem such as a host folder or NFS export mounted on a
 //! volume). Walking tens of gigabytes takes a while, so the agent runs this
-//! in a child process of its own (`Measuring`), never on a thread: the agent
-//! must stay single-threaded for clone3, and a container or exec cloned
-//! while a thread held the allocator's lock waited on it forever, before
-//! its execve.
+//! in a child process of its own (`Job`), never on a thread: the agent must
+//! stay single-threaded, since it starts containers and execs with clone3.
+//! A thread that held the allocator's lock at that moment left the child
+//! with the lock taken and nobody to release it: the child hung on its
+//! first allocation, before its root was in place, and the start never
+//! finished, nor did a stop, exec or rm of that container (with a terminal,
+//! nor did the agent's loop, which waits for that root, and so every request
+//! after it). The stuck child also kept the agent's listening sockets, so
+//! the next engine start could not start an agent.
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use super::sys;
-
-/// A measurement under way in a child process, whose lines come back
-/// through a pipe the agent polls.
-pub struct Measuring {
-    // The agent reaps it with every other child; the tests wait for it.
+/// A measurement running in a child process. The agent polls `fd` and calls
+/// `read` when it is readable; the child is reaped like any other child.
+pub struct Job {
+    /// Only the tests look: the agent reaps it like any other child.
     #[cfg_attr(not(test), allow(dead_code))]
     pid: libc::pid_t,
-    from: OwnedFd,
-    got: Vec<u8>,
+    out: OwnedFd,
+    buf: Vec<u8>,
 }
 
-impl Measuring {
-    /// Forks the child that runs `measure`. The caller must be
-    /// single-threaded, as with any fork.
-    pub fn start(layers: &Path, containers: &Path, volumes: &Path) -> io::Result<Self> {
-        let (from, to) = sys::pipe()?;
+impl Job {
+    /// Forks a child that runs `measure` and writes its lines to a pipe.
+    /// The caller must be single-threaded, as with any fork that allocates
+    /// in the child (the agent is).
+    pub fn start(layers: &Path, containers: &Path, volumes: &Path) -> io::Result<Job> {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe2 writes.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: pipe2 succeeded, so both descriptors are fresh and ours.
+        let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         // SAFETY: the agent is single-threaded, so the child is a consistent
-        // copy. It only walks the disk, writes to the pipe, then exits.
+        // copy. It only measures, writes and exits.
         match unsafe { libc::fork() } {
             0 => {
-                // A walk can take minutes: none of the agent's descriptors
-                // (a network's DNS socket) may stay open in it meanwhile.
-                sys::close_now(&sys::close_ranges(&[to.as_raw_fd()]));
-                let lines = measure(layers, containers, volumes);
-                let mut out = fs::File::from(to);
-                let code = i32::from(out.write_all(lines.join("\n").as_bytes()).is_err());
+                drop(r);
+                // Nothing of the agent's but stdio and the pipe: a child left
+                // behind must not hold its lock or its sockets.
+                super::sys::close_now(&super::sys::close_ranges(&[w.as_raw_fd()]));
+                let mut text = measure(layers, containers, volumes).join("\n");
+                text.push('\n');
+                let mut left = text.as_bytes();
+                while !left.is_empty() {
+                    // SAFETY: writing from a buffer we own to a descriptor we own.
+                    let n = unsafe { libc::write(w.as_raw_fd(), left.as_ptr().cast(), left.len()) };
+                    if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if n <= 0 {
+                        break;
+                    }
+                    left = &left[n as usize..];
+                }
                 // SAFETY: leaving the child without running the parent's destructors.
-                unsafe { libc::_exit(code) }
+                unsafe { libc::_exit(0) }
             }
             pid if pid < 0 => Err(io::Error::last_os_error()),
             pid => {
-                drop(to);
-                sys::set_nonblocking(from.as_raw_fd())?;
-                Ok(Measuring { pid, from, got: Vec::new() })
+                drop(w);
+                // SAFETY: fcntl on a descriptor we own.
+                unsafe { libc::fcntl(r.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+                Ok(Job { pid, out: r, buf: Vec::new() })
             }
         }
     }
 
-    pub fn fd(&self) -> i32 {
-        self.from.as_raw_fd()
+    pub fn fd(&self) -> RawFd {
+        self.out.as_raw_fd()
     }
 
     #[cfg(test)]
@@ -63,25 +86,27 @@ impl Measuring {
         self.pid
     }
 
-    /// Reads what the child wrote so far: the lines once it is done (the
-    /// pipe closed), None while it still runs. The agent reaps the child
-    /// like any other.
+    /// Takes what the child has written so far. Once it has closed its end
+    /// (done, or gone), the lines it gave; until then None.
     pub fn read(&mut self) -> Option<Vec<String>> {
-        let mut buf = [0u8; 16 << 10];
+        let mut chunk = [0u8; 16 << 10];
         loop {
             // SAFETY: reading into a buffer we own from a descriptor we own.
-            let n = unsafe { libc::read(self.from.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                self.got.extend_from_slice(&buf[..n as usize]);
-                continue;
-            }
-            match (n < 0).then(|| io::Error::last_os_error().kind()) {
-                Some(io::ErrorKind::Interrupted) => {}
-                Some(io::ErrorKind::WouldBlock) => return None,
-                _ => break,
+            let n = unsafe { libc::read(self.out.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            match n {
+                0 => break,
+                n if n > 0 => self.buf.extend_from_slice(&chunk[..n as usize]),
+                _ => match io::Error::last_os_error().kind() {
+                    io::ErrorKind::Interrupted => {}
+                    io::ErrorKind::WouldBlock => return None,
+                    _ => break,
+                },
             }
         }
-        Some(String::from_utf8_lossy(&self.got).lines().map(str::to_owned).collect())
+        // Only whole lines: a child that died mid-line gave no number for it.
+        let text = String::from_utf8_lossy(&self.buf);
+        let whole = text.rfind('\n').map_or("", |end| &text[..end]);
+        Some(whole.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect())
     }
 }
 
@@ -173,14 +198,48 @@ mod tests {
         assert!(size("c", "c1") < 64 << 10);
         let v = size("v", "data");
         assert!((256 << 10..512 << 10).contains(&v), "the hard link was counted twice, or the symlink followed: {v}");
+        let _ = fs::remove_dir_all(&root);
+    }
 
-        // The agent's way: the same lines, from a child process.
-        let mut m = Measuring::start(&layers, &containers, &volumes).unwrap();
+    /// The measurement runs in a child process, not on a thread of the
+    /// agent's: a thread there broke every clone3 that raced it (the child
+    /// inherited a held allocator lock and hung). Here the job's pid is
+    /// another process, which gives the same lines as `measure`.
+    #[test]
+    fn a_job_measures_in_a_child_process() {
+        let root = std::env::temp_dir().join(format!("kiri-usage-job-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (layers, containers, volumes) = (root.join("layers"), root.join("containers"), root.join("volumes"));
+        // More lines than a pipe holds, so the child waits on the reader.
+        for i in 0..3000 {
+            fs::create_dir_all(layers.join(format!("{i:064x}"))).unwrap();
+        }
+        fs::create_dir_all(volumes.join("data/_data")).unwrap();
+        fs::write(volumes.join("data/_data/f"), vec![1u8; 8 << 10]).unwrap();
+
+        let mut job = Job::start(&layers, &containers, &volumes).unwrap();
+        // SAFETY: getpid has no preconditions.
+        assert_ne!(job.pid(), unsafe { libc::getpid() }, "measured in the agent's own process");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let lines = loop {
+            let mut pfd = libc::pollfd { fd: job.fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid pollfd.
+            unsafe { libc::poll(&mut pfd, 1, 100) };
+            if let Some(lines) = job.read() {
+                break lines;
+            }
+            assert!(std::time::Instant::now() < deadline, "the measurement did not finish");
+        };
         let mut status = 0;
-        // SAFETY: waiting for the child we just forked.
-        assert_eq!(unsafe { libc::waitpid(m.pid(), &mut status, 0) }, m.pid(), "the measurement is not a child process");
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "status {status}");
-        assert_eq!(m.read(), Some(lines));
+        // SAFETY: reaping the child the job forked.
+        assert_eq!(unsafe { libc::waitpid(job.pid(), &mut status, 0) }, job.pid());
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "status {status:#x}");
+        let mut want = measure(&layers, &containers, &volumes);
+        let mut got = lines;
+        want.sort();
+        got.sort();
+        assert_eq!(got.len(), 3001);
+        assert_eq!(got, want);
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -160,12 +160,25 @@ pub fn failed(host: &str) {
     }
 }
 
-/// The order Kiri's builder should try Hub's mirrors in: the last ranking,
-/// or the configured order before any; Hub itself is BuildKit's own last
-/// resort, so it is left out.
+/// The order Kiri's builder should try Hub's mirrors in: the last ranking
+/// of the hosts a pull timed (kept ten minutes) with those it didn't know
+/// after them, or the configured order before any; Hub itself is
+/// BuildKit's own last resort, so it is left out.
 pub fn for_builder() -> Vec<String> {
-    let candidates = configured();
-    cached(&candidates).unwrap_or(candidates).into_iter().filter(|h| h != ORIGIN).collect()
+    let ranked = RANKING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|r| r.at.elapsed() < RANK_FOR).map(|r| r.order.clone());
+    builder_order(configured(), ranked)
+}
+
+/// [`for_builder`] over `candidates` and the `ranked` hosts, if any.
+fn builder_order(candidates: Vec<String>, ranked: Option<Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let known = ranked.unwrap_or_default().into_iter().filter(|h| candidates.contains(h));
+    for h in known.chain(candidates.iter().cloned()) {
+        if h != ORIGIN && !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -193,6 +206,13 @@ mod tests {
         let ms = |n| Some(Duration::from_millis(n));
         let timed = vec![(ORIGIN.to_owned(), None), ("slow".to_owned(), ms(900)), ("dead".to_owned(), None), ("fast".to_owned(), ms(40))];
         assert_eq!(order(&timed), s(&["fast", "slow", "dead", ORIGIN]));
+    }
+
+    #[test]
+    fn the_builder_takes_the_ranked_hosts_first_and_never_hub() {
+        let c = s(&["a", "b", "c", ORIGIN]);
+        assert_eq!(builder_order(c.clone(), None), s(&["a", "b", "c"]));
+        assert_eq!(builder_order(c, Some(s(&["c", "gone", ORIGIN, "a"]))), s(&["c", "a", "b"]));
     }
 
     #[test]

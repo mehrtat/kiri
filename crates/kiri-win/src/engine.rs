@@ -129,6 +129,15 @@ pub fn emit(json: String) {
     Handle.eval(format!("window.kiri && kiri.on({json})"));
 }
 
+/// The window let go of its page (app.rs, Ui::close): the terminals, the
+/// log and the live figures it followed end with it, as when Linux's window
+/// closes. The page asks for what it needs again when it next loads.
+pub fn page_gone() {
+    crate::term::handle("closeall", "", &Value::Null, emit);
+    crate::detail::stop_logs();
+    crate::detail::stop_stats();
+}
+
 pub fn notice(kind: &str, text: &str) -> String {
     json!({"type": "notice", "kind": kind, "text": text}).to_string()
 }
@@ -210,7 +219,7 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
                     a @ ("start" | "stop" | "restart" | "pause" | "unpause") => ("POST", format!("/containers/{id}/{a}")),
                     _ => continue,
                 };
-                let result = expect_ok(client::request(method, &path, None));
+                let result = expect_done(client::request(method, &path, None));
                 // Refused to start (a port taken): the container's page says why.
                 if let (Err(e), "start") = (&result, action.as_str()) {
                     emit(json!({"type": "startfailed", "id": id, "error": e.to_string()}).to_string());
@@ -225,6 +234,7 @@ fn engine(rx: &Receiver<Cmd>, tx: Sender<Cmd>) {
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
                 vm_panel();
+                emit_docker_state_if_changed();
                 if LISTED.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= LIST_EVERY {
                     refresh();
                 }
@@ -243,7 +253,12 @@ fn watch(tx: Sender<Cmd>) {
             }
             // A Kubernetes node already running gets its kubectl context.
             crate::k8s::sync_soon();
-            let _ = client::events(|_| tx.send(Cmd::Refresh).is_ok());
+            crate::watch::notify_containers_changed();
+            crate::wslconfig::sync_wsl_integration_soon();
+            let _ = client::events(|_| {
+                crate::watch::notify_containers_changed();
+                tx.send(Cmd::Refresh).is_ok()
+            });
         }
         std::thread::sleep(Duration::from_secs(1));
     });
@@ -252,6 +267,14 @@ fn watch(tx: Sender<Cmd>) {
 pub fn expect_ok(r: io::Result<client::Response>) -> io::Result<()> {
     let r = r?;
     if r.ok() { Ok(()) } else { Err(io::Error::other(r.error())) }
+}
+
+/// A container action's answer, as on the Mac and Linux: Docker's 304 is
+/// "already so" (Stop on a stopped container, Start on a running one), so
+/// done, not an empty red toast.
+fn expect_done(r: io::Result<client::Response>) -> io::Result<()> {
+    let r = r?;
+    if r.ok() || r.status == 304 { Ok(()) } else { Err(io::Error::other(r.error())) }
 }
 
 fn act(result: io::Result<()>) {
@@ -271,7 +294,7 @@ pub(crate) fn path_escape(s: &str) -> String {
 /// daemon was up, sent Start and so undid it (#394).
 fn bring_up(launch: bool) {
     // Up and stopped already: nothing to bring up, and no "booting" shown.
-    if launch && client::alive_quick() && stopped() {
+    if launch && client::alive_quick() && stopped() == Some(true) {
         return refresh();
     }
     emit(state("booting", None));
@@ -290,15 +313,18 @@ fn bring_up(launch: bool) {
 }
 
 /// Whether bringing Kiri up wakes the engine: Start always does, a launch
-/// only when the person had not stopped it.
-fn wakes(launch: bool, stopped: bool) -> bool {
-    !(launch && stopped)
+/// only when the engine said it was not stopped. Not knowing (its /info
+/// did not answer: an engine just started, or a wsl.exe slow after Windows
+/// woke) is no reason to wake it: that ended a person's Stop. A docker
+/// command wakes an engine that was only asleep anyway.
+fn wakes(launch: bool, stopped: Option<bool>) -> bool {
+    !launch || stopped == Some(false)
 }
 
 /// Whether Kiri was stopped (Stop in the window or the tray): then it stays
-/// off until Start.
-fn stopped() -> bool {
-    client::get("/info").is_ok_and(|i| i["KiriStopped"] == true)
+/// off until Start. None when the engine's /info did not answer.
+fn stopped() -> Option<bool> {
+    client::get_background("/info").ok().map(|i| i["KiriStopped"] == true)
 }
 
 /// The daemon's wake; a Linux host has no VM to wake, which is fine.
@@ -318,15 +344,24 @@ pub(crate) fn ensure_daemon() -> io::Result<()> {
         start_daemon()?;
     }
     std::thread::spawn(crate::update::catch_up_engine);
+    crate::wslconfig::sync_wsl_integration_soon();
     Ok(())
 }
 
 /// Starts the daemon in WSL, this app's engine copied in first.
 fn start_daemon() -> io::Result<()> {
+    if let Some(missing) = crate::storage::unavailable() {
+        crate::storage::emit_report();
+        return Err(io::Error::other(crate::storage::unavailable_message(&missing)));
+    }
     crate::serve::log("engine: not answering; starting it in WSL");
     // The engine this app installed, not one an update left behind.
     match crate::update::sync_engine() {
-        Ok(true) => crate::serve::log("engine: copied this version's engine into WSL"),
+        Ok(true) => {
+            crate::serve::log("engine: copied this version's engine into WSL");
+            // The bridge was started from the engine that was there before.
+            crate::serve::renew_bridge();
+        }
         Ok(false) => {}
         Err(e) => crate::serve::log(&format!("engine: could not copy the engine into WSL ({e}); starting the one there")),
     }
@@ -733,12 +768,59 @@ fn about() {
     );
 }
 
-/// The status bar's left side: this build, and which engine `docker` talks
-/// to by default, as `docker context show` says (it knows DOCKER_CONTEXT,
-/// DOCKER_HOST and wherever Docker Desktop keeps the CLI config).
-fn status_event() -> String {
-    let context = docker(&["context", "show"]).ok().map(|s| s.trim().to_owned()).filter(|c| !c.is_empty());
-    json!({"type": "status", "version": env!("CARGO_PKG_VERSION"), "share": true, "app": "Kiri", "ours": "kiri", "context": context.unwrap_or_else(|| "default".into())}).to_string()
+fn npipe_host(pipe: &str) -> String {
+    format!("npipe:{}", pipe.replace('\\', "/"))
+}
+
+fn context_meta(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use sha2::Digest as _;
+    let sum = sha2::Sha256::digest(name.as_bytes());
+    let hex: String = sum.iter().map(|b| format!("{b:02x}")).collect();
+    dir.join("contexts/meta").join(hex)
+}
+
+fn docker_state() -> (String, String) {
+    let endpoint = crate::serve::docker_engine_endpoint();
+    let pipe = crate::client::pipe();
+    let ours = npipe_host(&pipe);
+    let ctx = crate::flavor::CONTEXT.get();
+    let cli = crate::dockerctx::current_cli(ctx, &[&ours], &endpoint);
+    let status = crate::dockerctx::status_event(env!("CARGO_PKG_VERSION"), false, crate::flavor::APP.get(), ctx, &cli).to_string();
+    let sock = crate::dockerctx::sock_event(crate::serve::DOCKER_ENGINE, &endpoint, &ours, false).to_string();
+    (status, sock)
+}
+
+static LAST_DOCKER_STATE: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+fn emit_docker_state() {
+    let (status, sock) = docker_state();
+    *LAST_DOCKER_STATE.lock().unwrap_or_else(PoisonError::into_inner) = (status.clone(), sock.clone());
+    emit(status);
+    emit(sock);
+}
+
+fn emit_docker_state_if_changed() {
+    let (status, sock) = docker_state();
+    let (send_status, send_sock) = {
+        let mut last = LAST_DOCKER_STATE.lock().unwrap_or_else(PoisonError::into_inner);
+        let ss = if last.0 != status { last.0 = status.clone(); true } else { false };
+        let sd = if last.1 != sock { last.1 = sock.clone(); true } else { false };
+        (ss, sd)
+    };
+    if send_status {
+        emit(status);
+    }
+    if send_sock {
+        emit(sock);
+    }
+}
+
+/// Ensures the `kiri` context exists and is plain `docker`'s current context,
+/// keeping logins, credential helpers and plugin folders untouched (#369).
+pub fn use_kiri_context() -> io::Result<()> {
+    let dir = crate::dockerctx::docker_dir().ok_or_else(|| io::Error::other("USERPROFILE is not set"))?;
+    let ours = crate::flavor::CONTEXT.get();
+    crate::dockerctx::use_ours(&dir, &context_meta(&dir, ours), ours, "Kiri (WSL2)", &npipe_host(&crate::client::pipe()))
 }
 
 /// The docker CLI on Kiri's context, without a console window, for Compose
@@ -753,18 +835,6 @@ fn compose_cli() -> io::Result<std::process::Command> {
 /// The compose files opened in the window: %LOCALAPPDATA%\Kiri\compose.json.
 fn compose_store() -> Option<std::path::PathBuf> {
     prefs_path().map(|p| p.with_file_name("compose.json"))
-}
-
-/// Runs the docker CLI without a console window: its output, or why it failed.
-fn docker(args: &[&str]) -> io::Result<String> {
-    let mut cmd = crate::win::tool(&crate::detail::docker_cli());
-    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-    let out = cmd.args(args).output()?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned()))
-    }
 }
 
 fn builds_event() -> String {
@@ -803,10 +873,15 @@ fn build_with() {
     }
 }
 
-/// Which engine plain `docker` uses: Kiri, or back to the one before.
+/// Which engine plain `docker` uses: Kiri (made first if missing), "default",
+/// or another context that exists, keeping logins and plugin folders.
 fn use_context(name: &str) {
-    let result = if name.is_empty() { Err(io::Error::other("no context named")) } else { docker(&["context", "use", name]).map(drop) };
-    emit(status_event());
+    let result = (|| -> io::Result<()> {
+        let dir = crate::dockerctx::docker_dir().ok_or_else(|| io::Error::other("USERPROFILE is not set"))?;
+        let ours = crate::flavor::CONTEXT.get();
+        crate::dockerctx::switch(&dir, &context_meta(&dir, name), name, ours, "Kiri (WSL2)", &npipe_host(&crate::client::pipe()))
+    })();
+    emit_docker_state();
     emit(json!({"type": "usedcontext", "name": name, "error": result.as_ref().err().map(|e| e.to_string())}).to_string());
 }
 
@@ -884,7 +959,29 @@ pub fn prefs() -> Value {
     if p.get("theme").is_none() {
         p["theme"] = "dark".into();
     }
+    p["watchBindMounts"] = json!(crate::watch::is_enabled());
+    if p.get("startAtLogin").is_none() {
+        p["startAtLogin"] = crate::setup::start_at_login().into();
+    }
+    if p.get("stopOnQuit").is_none() {
+        p["stopOnQuit"] = false.into();
+    }
     p
+}
+
+/// Stops running containers and terminates Kiri's WSL distro when quitting
+/// with "Stop the engine when Kiri quits" on.
+pub fn stop() {
+    sharing::close_all();
+    let _ = match expect_ok(client::request("POST", "/kiri/stop", None)) {
+        Err(e) if e.to_string().contains("404") => expect_ok(client::request("POST", "/kiri/sleep", None)),
+        r => r,
+    };
+    if let Some(d) = distro() {
+        let mut cmd = crate::win::tool("wsl.exe");
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+        let _ = crate::update::output_within(cmd.args(["--terminate", &d]), crate::update::WSL_LIMIT);
+    }
 }
 
 /// `en` in the window's language (lang.rs), for words sent to the page:
@@ -899,7 +996,16 @@ pub fn trf(en: &str, vars: &[(&str, &dyn std::fmt::Display)]) -> String {
 }
 
 fn set_pref(name: &str, value: Value) {
-    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked") {
+    if name == "watchBindMounts" {
+        let on = value.as_bool().unwrap_or(false);
+        if crate::watch::save_enabled(on).is_err() {
+            emit(notice("error", &trf("Could not save the setting to {path}", &[("path", &"%LOCALAPPDATA%\\Kiri\\settings.json")])));
+            return;
+        }
+        crate::watch::set_enabled(crate::watch::is_enabled());
+        return;
+    }
+    if !matches!(name, "font" | "mono" | "scale" | "termH" | "termFs" | "termFont" | "domainsAsked" | "theme" | "accent" | "starAsked" | "updateAuto" | "lang" | "langAsked" | "closeButton" | "startAtLogin" | "stopOnQuit") {
         return;
     }
     let Some(path) = prefs_path() else { return };
@@ -934,14 +1040,30 @@ mod tests {
     use super::{allowed_url, unanswered, wakes};
     use std::io::ErrorKind;
 
+    /// As on the Mac and Linux: Stop on a stopped container, or Start on a
+    /// running one, is done (Docker's 304, with no body), not an empty error.
+    #[test]
+    fn a_container_already_so_is_done_not_an_empty_error() {
+        use super::{client::Response, expect_done};
+        let answer = |status: u16, body: &str| Ok(Response { status, body: body.as_bytes().to_vec() });
+        assert!(expect_done(answer(304, "")).is_ok(), "already stopped, or already running");
+        assert!(expect_done(answer(204, "")).is_ok());
+        let refused = expect_done(answer(409, r#"{"message":"cannot start a paused container, try unpause instead"}"#));
+        assert_eq!(refused.unwrap_err().to_string(), "cannot start a paused container, try unpause instead");
+        assert!(expect_done(Err(std::io::Error::other("no engine"))).is_err());
+    }
+
     /// Only Start ends a Stop: Kiri coming up (the window, or hidden at
     /// login) starts the engine unless the person stopped it.
     #[test]
     fn a_launch_does_not_undo_a_stop() {
-        assert!(wakes(false, true), "Start wakes a stopped engine");
-        assert!(wakes(false, false));
-        assert!(wakes(true, false), "a launch starts an engine that was not stopped");
-        assert!(!wakes(true, true), "a launch leaves a stopped engine stopped");
+        assert!(wakes(false, Some(true)), "Start wakes a stopped engine");
+        assert!(wakes(false, Some(false)));
+        assert!(wakes(false, None), "Start wakes an engine whatever it said");
+        assert!(wakes(true, Some(false)), "a launch starts an engine that was not stopped");
+        assert!(!wakes(true, Some(true)), "a launch leaves a stopped engine stopped");
+        // #93: an /info that did not answer at launch is not "not stopped".
+        assert!(!wakes(true, None), "a launch that could not ask leaves a Stop alone");
     }
 
     /// Only a refused or absent engine shows as stopped; a slow answer
@@ -967,6 +1089,57 @@ mod tests {
         assert!(!allowed_url("http://evil.example\\x.kiri.localhost"));
         assert!(!allowed_url("https://evil.example/#.kiri.localhost"));
         assert!(!allowed_url("ftp://localhost/"));
+    }
+
+    #[test]
+    fn background_engine_checks_mark_background_and_wake_does_not() {
+        let info = super::client::mock_reply(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{\"KiriStopped\":true}");
+        assert_eq!(super::stopped(), Some(true));
+        let req = String::from_utf8(info.lock().unwrap().clone()).unwrap();
+        assert!(req.contains("\r\nX-Kiri-Background: 1\r\n"), "stopped() must mark background: {req}");
+
+        let wake_wire = super::client::mock_reply(b"HTTP/1.1 204 No Content\r\n\r\n");
+        super::wake().unwrap();
+        let req = String::from_utf8(wake_wire.lock().unwrap().clone()).unwrap();
+        assert!(req.starts_with("POST /kiri/wake HTTP/1.1\r\n"), "{req}");
+        assert!(!req.contains("X-Kiri-Background"), "wake() must not mark background: {req}");
+
+        let proxy_get = super::client::mock_reply(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"settings\":{}}");
+        let proxy_put = super::client::mock_reply(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        super::push_windows_proxy(serde_json::json!({"http": null, "https": null, "no_proxy": [], "pac": false}), |_| std::collections::HashMap::new());
+        let get_req = String::from_utf8(proxy_get.lock().unwrap().clone()).unwrap();
+        let put_req = String::from_utf8(proxy_put.lock().unwrap().clone()).unwrap();
+        assert!(get_req.starts_with("GET /kiri/proxy HTTP/1.1\r\n") && get_req.contains("\r\nX-Kiri-Background: 1\r\n"), "{get_req}");
+        assert!(put_req.starts_with("PUT /kiri/proxy/system HTTP/1.1\r\n") && put_req.contains("\r\nX-Kiri-Background: 1\r\n"), "{put_req}");
+    }
+
+    #[test]
+    fn saves_stop_on_quit_and_start_at_login_prefs() {
+        let dir = std::env::temp_dir().join(format!("kiri-win-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("LOCALAPPDATA");
+        // SAFETY: serialized within this test binary's prefs test.
+        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
+        assert_eq!(super::prefs()["stopOnQuit"], false);
+        super::set_pref("stopOnQuit", serde_json::json!(true));
+        assert_eq!(super::prefs()["stopOnQuit"], true);
+        super::set_pref("stopOnQuit", serde_json::json!(false));
+        assert_eq!(super::prefs()["stopOnQuit"], false);
+        super::set_pref("startAtLogin", serde_json::json!(false));
+        assert_eq!(super::prefs()["startAtLogin"], false);
+        super::set_pref("startAtLogin", serde_json::json!(true));
+        assert_eq!(super::prefs()["startAtLogin"], true);
+        match old {
+            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
+            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn npipe_host_formats_pipe_url() {
+        assert_eq!(super::npipe_host(r"\\.\pipe\kiri"), "npipe:////./pipe/kiri");
     }
 }
 
@@ -1003,7 +1176,8 @@ pub fn on_message(msg: &str) {
                 emit(r#"{"type":"starprompt"}"#.to_owned());
             }
             emit(domains_event());
-            emit(status_event());
+            emit_docker_state();
+            std::thread::spawn(crate::storage::emit_report);
             ask_language();
             // The first time, offer <name>.kiri.local, as the Mac does.
             if !crate::dns::installed() && crate::dns::serving() && prefs()["domainsAsked"] != true {
@@ -1020,8 +1194,9 @@ pub fn on_message(msg: &str) {
                 emit(crate::buildwith::event());
             });
             send(Cmd::Refresh);
-            // Opening the window starts Kiri, unless it was stopped: that waits for Start.
-            send(Cmd::Launch);
+            // Opening the window starts Kiri, unless it was stopped: that waits
+            // for Start (except when quitting stopped it with stopOnQuit).
+            send(if prefs()["stopOnQuit"] == true { Cmd::Start } else { Cmd::Launch });
             // Anything newer than this build, and a staged update not yet in.
             crate::update::check_now(false);
             // For checking the page by hand in a debug build.
@@ -1071,10 +1246,11 @@ pub fn on_message(msg: &str) {
                 emit(crate::buildwith::event());
             });
         }
-        // The docker CLI can take a moment: off the window's thread.
+        // Config update can be done synchronously or off-thread.
         "usecontext" => {
             std::thread::spawn(move || use_context(&c.name));
         }
+        "dockersock" => emit_docker_state(),
         // The Kubernetes section: Pods, Services, a pod's logs, Start.
         "k8s" => crate::k8s::handle(&c.action, &c.value),
         // Share: public links for a port or container, and the Share account.
@@ -1178,6 +1354,15 @@ pub fn on_message(msg: &str) {
                 let theme = c.value.as_str().unwrap_or("").to_owned();
                 Handle.run(move |ui| ui.set_theme(&theme));
             }
+            if c.name == "startAtLogin"
+                && let Some(on) = c.value.as_bool()
+                && let Err(e) = crate::setup::set_start_at_login(on)
+            {
+                crate::serve::log(&format!("start at sign-in: {e}"));
+                emit(notice("error", &e.to_string()));
+                emit(json!({"type": "prefs", "prefs": prefs()}).to_string());
+                return;
+            }
             set_pref(&c.name, c.value);
         }
         // A language the page doesn't carry yet (the main window and setup open
@@ -1198,6 +1383,14 @@ pub fn on_message(msg: &str) {
         "setproxy" => {
             let body = c.value;
             std::thread::spawn(move || proxy(Some(body)));
+        }
+        // Settings → Registries: daemon.json's lists, in the engine's distro.
+        "registryconfig" => {
+            std::thread::spawn(|| registry_config(None));
+        }
+        "setregistryconfig" => {
+            let body = c.value;
+            std::thread::spawn(move || registry_config(Some(body)));
         }
         // Settings → Resources: WSL's CPUs and memory, in .wslconfig.
         "resources" => crate::wslconfig::resources(None),
@@ -1312,6 +1505,31 @@ pub fn on_message(msg: &str) {
                 emit(builds_event());
             });
         }
+        // Settings → Storage: where WSL keeps Kiri's VHDX, and moving it.
+        "storage" => {
+            std::thread::spawn(crate::storage::emit_report);
+        }
+        "storagepick" => {
+            crate::app::pick_folder(&tr("Choose a storage folder"), |path| {
+                if let Some(p) = path {
+                    crate::storage::check_and_emit(Some(p.to_string_lossy().into_owned()), false, false);
+                }
+            });
+        }
+        "storagecheck" => {
+            let path = (!c.path.trim().is_empty()).then(|| c.path.clone());
+            let fresh = c.value["fresh"] == true;
+            let reset = c.value["reset"] == true;
+            std::thread::spawn(move || crate::storage::check_and_emit(path, fresh, reset));
+        }
+        "storagemove" => {
+            let path = (!c.path.trim().is_empty()).then(|| c.path.clone());
+            let fresh = c.value["fresh"] == true;
+            crate::storage::start_move(path, fresh);
+        }
+        "storagereset" => crate::storage::reset(),
+        "storageretry" => crate::storage::retry(),
+        "storageremoveold" => crate::storage::remove_old(),
         // Settings → Diagnostics and an error's Details: crate::diag.
         cmd @ ("diaglogs" | "diagreport" | "diagsend" | "diagcrashes" | "diagsendcrash" | "diagfolder") => {
             crate::diag::handle(cmd, c.name, c.id, &c.value);
@@ -1398,10 +1616,14 @@ fn windows_proxy() -> Value {
 
 /// Tells the daemon what Windows' proxy is. A proxy on Windows' own
 /// 127.0.0.1 (Windows' or one set in Settings → Network) is reached through
-/// the relay (relay.rs), and the daemon gets its ports too.
+/// the relay (relay.rs), and the daemon gets its ports too. Sent every
+/// minute, so marked as the window's own: it never keeps the VM awake.
 pub(crate) fn send_windows_proxy() {
-    let mut body = windows_proxy();
-    let custom = client::get("/kiri/proxy").map(|v| v["settings"].clone()).unwrap_or_default();
+    push_windows_proxy(windows_proxy(), crate::relay::ports);
+}
+
+fn push_windows_proxy(mut body: Value, relay_ports: impl FnOnce(&[u16]) -> std::collections::HashMap<u16, u16>) {
+    let custom = client::get_background("/kiri/proxy").map(|v| v["settings"].clone()).unwrap_or_default();
     let mut targets: Vec<u16> = [&body["http"], &body["https"], &custom["http"], &custom["https"]]
         .iter()
         .filter_map(|v| v.as_str())
@@ -1409,9 +1631,9 @@ pub(crate) fn send_windows_proxy() {
         .collect();
     targets.sort_unstable();
     targets.dedup();
-    let relay = crate::relay::ports(&targets);
+    let relay = relay_ports(&targets);
     body["relay"] = relay.iter().map(|(t, l)| (t.to_string(), json!(l))).collect::<serde_json::Map<_, _>>().into();
-    let _ = client::request("PUT", "/kiri/proxy/system", Some(&body));
+    let _ = client::request_with("PUT", "/kiri/proxy/system", Some(&body), true);
 }
 
 /// Settings → Domains: reads (or moves, then reads) the routers' ports. The
@@ -1449,6 +1671,32 @@ fn proxy(set: Option<Value>) {
         }
         Err(e) => json!({"type": "proxy", "error": e.to_string()}),
     };
+    emit(ev.to_string());
+}
+
+/// Settings → Registries: the engine's daemon.json (in its WSL distro):
+/// insecure registries and Docker Hub mirrors.
+/// The answer to a save says whether it was saved (`saved`), so the page
+/// knows its own save's answer from a read that crossed it.
+fn registry_config(set: Option<Value>) {
+    let saved = set.map(|body| match expect_ok(client::request("POST", "/kiri/registries", Some(&body))) {
+        Ok(()) => {
+            emit(notice("ok", &tr("Registry settings saved")));
+            true
+        }
+        Err(e) => {
+            emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &e)])));
+            false
+        }
+    });
+    let mut ev = match client::get("/kiri/registries") {
+        Ok(v) => v,
+        Err(e) => json!({"error": e.to_string()}),
+    };
+    ev["type"] = json!("registryconfig");
+    if let Some(saved) = saved {
+        ev["saved"] = json!(saved);
+    }
     emit(ev.to_string());
 }
 

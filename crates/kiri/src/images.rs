@@ -28,6 +28,10 @@ pub fn pull(args: &[String]) -> io::Result<()> {
                 eprintln!("{reference}: {layers} layers, {} ({cached} already here)", size(bytes));
             }
             Progress::Layer { .. } | Progress::Downloading { .. } => {}
+            Progress::MirrorFallback { mirror, reason } => {
+                eprintln!("{mirror}: {reason}; trying the next registry");
+            }
+            Progress::FromMirror { mirror } => eprintln!("{reference}: from the mirror {mirror}"),
             Progress::LayerDone { bytes, cached: was_cached, .. } => {
                 if was_cached {
                     cached.fetch_add(1, Ordering::Relaxed);

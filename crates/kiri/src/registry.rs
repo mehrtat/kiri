@@ -3,8 +3,10 @@
 //! where Docker keeps them (`certs.d/<host>/`, kiri_image::tls), which the
 //! engine reads on each request, so they count at once, with no restart.
 //!
-//! `kiri registry mirror`: Docker Hub's mirrors, which a pull of a Hub
-//! image chooses between by how fast each answers (kiri_image::mirrors).
+//! `kiri registry mirror order` and `builtin`: how a pull of a Hub image
+//! chooses between mirrors, by how fast each answers (kiri_image::mirrors).
+//! The mirror list itself, and `insecure`, are daemon.json's
+//! (registry_cli.rs), which main.rs hands those words to.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +16,9 @@ use kiri_image::tls;
 const USAGE: &str = "usage: kiri registry trust HOST [--ca FILE] [--client-cert FILE --client-key FILE] [--yes]\n\
     \x20      kiri registry ls\n\
     \x20      kiri registry rm HOST\n\
-    \x20      kiri registry mirror [ls | test | add HOST... | rm HOST... | builtin on|off]\n\
+    \x20      kiri registry mirror order [--test] | builtin on|off\n\
+    \x20      (kiri registry with no word, insecure ..., and mirror [list] | add | remove\n\
+    \x20      are daemon.json's: kiri registry --help)\n\
     HOST is the registry as images name it: registry.example.com, 10.0.0.5:5000.\n\
     Without --ca or a client certificate, trust takes the CA the registry sends,\n\
     once its SHA-256 fingerprint is confirmed (--yes confirms it unasked).";
@@ -23,7 +27,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     match args.first().map(String::as_str) {
         Some("trust") => trust(&args[1..]),
         Some("mirror" | "mirrors") => mirror(&args[1..]),
-        Some("ls" | "list") | None => list(),
+        Some("ls" | "list") => list(),
         Some("rm" | "remove") => match args.get(1) {
             Some(host) => remove(host),
             None => Err(usage()),
@@ -148,57 +152,30 @@ fn remove(host: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// `kiri registry mirror …`.
+/// `kiri registry mirror order|builtin …`; main.rs sends no other word here.
 fn mirror(args: &[String]) -> io::Result<()> {
     use kiri_image::mirrors;
-    let path = mirrors::settings_path();
-    let edit = |f: &dyn Fn(&mut mirrors::Settings) -> io::Result<()>| -> io::Result<()> {
-        let mut s = mirrors::load(&path);
-        f(&mut s)?;
-        mirrors::save(&path, &s).map_err(|e| match e.kind() {
-            io::ErrorKind::PermissionDenied => io::Error::new(e.kind(), format!("{}: permission denied (run it with sudo)", path.display())),
-            _ => io::Error::new(e.kind(), format!("{}: {e}", path.display())),
-        })?;
-        println!("Saved in {}; the next pull uses it.", path.display());
-        Ok(())
-    };
-    let hosts = |rest: &[String]| -> io::Result<Vec<String>> {
-        if rest.is_empty() {
-            return Err(usage());
-        }
-        rest.iter().map(|h| mirrors::host_of(h).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("not a registry host: {h:?}")))).collect()
-    };
     match args.first().map(String::as_str) {
-        None | Some("ls" | "list") => show(false),
-        Some("test") => show(true),
-        Some("add") => {
-            let new = hosts(&args[1..])?;
-            edit(&|s| {
-                for h in &new {
-                    if !s.mirrors.contains(h) {
-                        s.mirrors.push(h.clone());
-                    }
-                }
-                Ok(())
-            })
-        }
-        Some("rm" | "remove") => {
-            let gone = hosts(&args[1..])?;
-            edit(&|s| {
-                s.mirrors.retain(|m| !gone.contains(m));
-                Ok(())
-            })
-        }
+        Some("order") => match args.get(1).map(String::as_str) {
+            None => show(false),
+            Some("--test") => show(true),
+            _ => Err(usage()),
+        },
         Some("builtin") => {
             let on = match args.get(1).map(String::as_str) {
                 Some("on") => true,
                 Some("off") => false,
                 _ => return Err(usage()),
             };
-            edit(&|s| {
-                s.builtin = on;
-                Ok(())
-            })
+            let path = mirrors::settings_path();
+            let mut s = mirrors::load(&path);
+            s.builtin = on;
+            mirrors::save(&path, &s).map_err(|e| match e.kind() {
+                io::ErrorKind::PermissionDenied => io::Error::new(e.kind(), format!("{}: permission denied (run it with sudo)", path.display())),
+                _ => io::Error::new(e.kind(), format!("{}: {e}", path.display())),
+            })?;
+            println!("Saved in {}; the next pull uses it.", path.display());
+            Ok(())
         }
         _ => Err(usage()),
     }
@@ -206,7 +183,9 @@ fn mirror(args: &[String]) -> io::Result<()> {
 
 /// The hosts a Hub pull tries, in the order it tries them, each with how
 /// fast it answered; with `test`, also the digest each gives for
-/// `alpine:latest`, beside the one most of them give.
+/// `alpine:latest`, beside the one most of them give. These are the hosts
+/// of the fork's own list, Docker's, the built-in ones and Hub (daemon.json's
+/// mirrors, which `kiri registry mirror` lists, come first in a pull).
 fn show(test: bool) -> io::Result<()> {
     use kiri_image::mirrors;
     let client = kiri_image::Client::new();

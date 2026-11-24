@@ -2,9 +2,11 @@ mod agent;
 mod cgroup;
 mod container;
 mod devices;
+mod disk;
 mod copy;
 mod dns;
 mod fsnotify;
+mod firewall;
 mod fsview;
 mod hostopts;
 mod inroot;
@@ -16,7 +18,9 @@ mod relay;
 mod roots;
 mod seccomp;
 mod sys;
+mod tarnum;
 mod transport;
+mod trim;
 mod usb;
 mod usage;
 mod volmount;
@@ -47,6 +51,8 @@ pub fn main() {
 }
 
 fn run(init_start_ns: u64) -> io::Result<()> {
+    // Before anything starts: every container and step inherits them.
+    engine_rlimits();
     let paths = if transport::is_host_process() {
         // On a Linux host: the host's kernel filesystems, network and clock.
         host_dirs()?
@@ -68,6 +74,16 @@ fn run(init_start_ns: u64) -> io::Result<()> {
         net::remove_host_network();
     }
     served
+}
+
+/// Sets the limits containers and build steps inherit (hostopts::agent_rlimits),
+/// each on its own: one refused is said and the others are still set.
+fn engine_rlimits() {
+    for lim in hostopts::agent_rlimits() {
+        if let Err(e) = hostopts::set_rlimits(&[lim]) {
+            eprintln!("kiri-init: resource limits: {e}");
+        }
+    }
 }
 
 fn serve(paths: &container::Paths, init_start_ns: u64) -> io::Result<()> {
@@ -139,14 +155,37 @@ fn host_dirs() -> io::Result<container::Paths> {
     // SAFETY: umask only changes this process's file-creation mask.
     unsafe { libc::umask(0o022) };
     let root = PathBuf::from(DATA);
+    if let Some(data) = std::env::var_os("KIRI_AGENT_DATA").map(PathBuf::from).filter(|p| p.is_absolute() && p != &root) {
+        mount_agent_data(&data, &root)?;
+    }
     let mkdir = |p: &std::path::Path, mode: u32| -> io::Result<()> {
         std::fs::create_dir_all(p)?;
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
     };
     mkdir(&root, 0o710)?;
     mkdir(&root.join("volumes"), 0o700)?;
-    take_over(&root)?;
-    let paths = container::Paths { layers: root.join("layers"), containers: root.join("containers"), cgroup: host_cgroup()? };
+    // What a dead agent left running can hold its lock (see `take_over`).
+    let leftovers = || {
+        let Ok(old) = std::fs::read_to_string(root.join("agent.cgroup")) else { return };
+        let old = PathBuf::from(old.trim());
+        if is_cgroup2_dir(&old) {
+            let paths = container::Paths {
+                layers: root.join("layers"),
+                containers: root.join("containers"),
+                cgroup: old.clone(),
+                cgroup_root: old.clone(),
+            };
+            container::sweep(&paths, &old);
+        }
+    };
+    take_over(&root, leftovers)?;
+    let (cgroup_root, cgroup) = host_cgroup()?;
+    let paths = container::Paths {
+        layers: root.join("layers"),
+        containers: root.join("containers"),
+        cgroup,
+        cgroup_root,
+    };
     mkdir(&paths.layers, 0o700)?;
     mkdir(&paths.containers, 0o700)?;
     // What an agent that died uncleanly left running: under the cgroup it
@@ -154,7 +193,7 @@ fn host_dirs() -> io::Result<container::Paths> {
     let record = root.join("agent.cgroup");
     if let Ok(old) = std::fs::read_to_string(&record) {
         let old = PathBuf::from(old.trim());
-        if old != paths.cgroup && old.starts_with("/sys/fs/cgroup") {
+        if old != paths.cgroup && is_cgroup2_dir(&old) {
             container::sweep(&paths, &old);
         }
     }
@@ -162,6 +201,39 @@ fn host_dirs() -> io::Result<container::Paths> {
     std::fs::write(&record, paths.cgroup.as_os_str().as_encoded_bytes())?;
     std::env::set_current_dir(&paths.layers)?;
     Ok(paths)
+}
+
+/// Bind-mounts `src` (the chosen folder's `agent` directory, from
+/// `KIRI_AGENT_DATA`) onto `/var/lib/kiri` so every agent path stays under
+/// `/var/lib/kiri` while living on the chosen disk. No-op when `src` is
+/// already mounted there; detaches any other mount on `target` first.
+fn mount_agent_data(src: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    std::fs::create_dir_all(src)?;
+    std::fs::create_dir_all(target)?;
+    let (sm, tm) = (std::fs::metadata(src)?, std::fs::metadata(target)?);
+    if (sm.dev(), sm.ino()) == (tm.dev(), tm.ino()) {
+        return Ok(());
+    }
+    let c_target = CString::new(target.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    if std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|m| is_mounted_at(&m, target)) {
+        // SAFETY: valid NUL-terminated path; detaches a stale mount at `target`.
+        unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) };
+    }
+    let c_src = CString::new(src.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: valid NUL-terminated paths for a bind mount (fstype and data unused).
+    check(unsafe { libc::mount(c_src.as_ptr(), c_target.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } as _, "bind-mount KIRI_AGENT_DATA").map(drop)
+}
+
+/// Whether `/proc/self/mountinfo` lists a mount whose target is `target`.
+fn is_mounted_at(mountinfo: &str, target: &std::path::Path) -> bool {
+    let want = target.to_string_lossy();
+    mountinfo.lines().any(|line| {
+        let Some((before, _)) = line.split_once(" - ") else { return false };
+        before.split_whitespace().nth(4).is_some_and(|mp| unescape_mount_path(mp) == want)
+    })
 }
 
 /// The lock on a Linux host's data directory, held while the agent runs.
@@ -173,7 +245,15 @@ static AGENT_LOCK: std::sync::OnceLock<File> = std::sync::OnceLock::new();
 /// it cleans up, then SIGKILL), and waited for a few seconds otherwise (a
 /// daemon still shutting down); if it stays, starting fails and says why
 /// rather than failing later on its sockets and ports.
-fn take_over(root: &std::path::Path) -> io::Result<()> {
+///
+/// The lock can outlive the agent that took it: a child it cloned holds a
+/// copy of the descriptor until it closes it, and one that hung before
+/// then (a container's first process stuck before its root was in place)
+/// kept it for good, so every later agent gave up here. Once the holder is
+/// gone, `leftovers` stops what this data directory's containers left
+/// running (the old agent's containers, which the start-up sweep stops
+/// anyway), once, and the lock is tried again.
+fn take_over(root: &std::path::Path, leftovers: impl Fn()) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let path = root.join("agent.lock");
@@ -184,6 +264,7 @@ fn take_over(root: &std::path::Path) -> io::Result<()> {
     };
     let start = std::time::Instant::now();
     let mut signalled = None;
+    let mut swept = false;
     while !locked(&file) {
         let mut text = String::new();
         let _ = (&file).read_to_string(&mut text);
@@ -192,36 +273,26 @@ fn take_over(root: &std::path::Path) -> io::Result<()> {
         let daemon = parent_of(old);
         let orphan = old > 0 && !daemon.is_some_and(is_daemon);
         let waited = start.elapsed();
-        // Only the processes that hold the lock are signalled, never `old`
-        // by its number alone: a dead agent's pid may be another process's
-        // by now.
+        // Gone: whatever holds the lock now is something it left running.
+        if orphan && !swept && daemon.is_none() {
+            eprintln!("kiri-init: agent {old} is gone but its lock is held: stopping the containers it left");
+            leftovers();
+            swept = true;
+            continue;
+        }
         if orphan && signalled.is_none() {
             eprintln!("kiri-init: stopping agent {old}, left running by a daemon that is gone");
-            for pid in lock_holders(&file) {
-                // The agent cleans up on SIGTERM. Any other holder is a child
-                // of it that never reached its execve (Kiri before 0.4.5): it
-                // kept every descriptor the agent had, this lock's too, waits
-                // on nothing that will come, and outlives the agent. Left
-                // alone it kept every later agent from starting.
-                let sig = if pid == old { libc::SIGTERM } else { libc::SIGKILL };
-                // SAFETY: signalling a process that holds our data directory's lock.
-                unsafe { libc::kill(pid, sig) };
-            }
+            // SAFETY: signalling the process that holds our data directory's lock.
+            unsafe { libc::kill(old, libc::SIGTERM) };
             signalled = Some(waited);
         } else if orphan && signalled.is_some_and(|t| waited - t > std::time::Duration::from_secs(5)) {
-            for pid in lock_holders(&file) {
-                // SAFETY: as above; it did not stop on SIGTERM.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
+            // SAFETY: as above; it did not stop on SIGTERM.
+            unsafe { libc::kill(old, libc::SIGKILL) };
         }
         if waited > std::time::Duration::from_secs(8) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
-                format!(
-                    "another Kiri engine is running on this machine (agent {old}, daemon {}, lock held by {:?}): stop it first",
-                    daemon.unwrap_or(0),
-                    lock_holders(&file)
-                ),
+                format!("another Kiri engine is running on this machine (agent {old}, daemon {}): stop it first", daemon.unwrap_or(0)),
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -231,24 +302,6 @@ fn take_over(root: &std::path::Path) -> io::Result<()> {
     file.write_all_at(format!("{}\n", std::process::id()).as_bytes(), 0)?;
     let _ = AGENT_LOCK.set(file);
     Ok(())
-}
-
-/// The other processes that have `file` open, from /proc/<pid>/fd.
-fn lock_holders(file: &File) -> Vec<libc::pid_t> {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(lock) = file.metadata() else { return Vec::new() };
-    let own = std::process::id() as libc::pid_t;
-    let Ok(procs) = std::fs::read_dir("/proc") else { return Vec::new() };
-    procs
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<libc::pid_t>().ok())
-        .filter(|&pid| pid != own)
-        .filter(|pid| {
-            std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|fds| {
-                fds.flatten().any(|fd| std::fs::metadata(fd.path()).is_ok_and(|m| m.dev() == lock.dev() && m.ino() == lock.ino()))
-            })
-        })
-        .collect()
 }
 
 /// A live process's parent, from /proc/<pid>/stat.
@@ -265,6 +318,111 @@ fn parent_of(pid: libc::pid_t) -> Option<libc::pid_t> {
 /// have any name). PID 1 or a subreaper adopting an orphan is not.
 fn is_daemon(pid: libc::pid_t) -> bool {
     pid > 1 && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c.split(|b| *b == 0).any(|a| a == b"daemon"))
+}
+
+fn is_cgroup2_dir(path: &std::path::Path) -> bool {
+    path.is_absolute() && path.is_dir() && sys::is_cgroup2(path)
+}
+
+/// The cgroup v2 path relative to the unified hierarchy root from `/proc/self/cgroup`.
+fn cgroup2_rel(proc_cgroup: &str) -> String {
+    proc_cgroup.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("/").trim().trim_start_matches('/').to_owned()
+}
+
+/// Unescapes `/proc/self/mountinfo` octal escapes (`\040`, `\011`, `\012`, `\134`).
+fn unescape_mount_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
+        {
+            let val = ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
+            out.push(val);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Writable `cgroup2` mounts visible in `/proc/self/mountinfo`, ordered by
+/// preference: `/sys/fs/cgroup`, `/sys/fs/cgroup/unified` (stock WSL 2 and
+/// hybrid systemd), other mounts under `/sys/fs/cgroup/`, then any other
+/// top-level (`root == "/"`) mount. Overmounted entries (for example `tmpfs`
+/// stacked over an earlier `cgroup2` mount) are excluded because only the last
+/// mount on each path is active.
+fn cgroup2_mounts(mountinfo: &str) -> Vec<PathBuf> {
+    struct Entry {
+        fstype: String,
+        root: String,
+        rw: bool,
+    }
+    let has_ro = |opts: &str| opts.split(',').any(|o| o == "ro");
+    let mut active: std::collections::BTreeMap<String, Entry> = std::collections::BTreeMap::new();
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else { continue };
+        let mut b = before.split_whitespace();
+        let (Some(_id), Some(_parent), Some(_dev), Some(root), Some(mp), Some(mopts)) =
+            (b.next(), b.next(), b.next(), b.next(), b.next(), b.next())
+        else {
+            continue;
+        };
+        let mut a = after.split_whitespace();
+        let (Some(fstype), Some(_src), Some(sopts)) = (a.next(), a.next(), a.next()) else { continue };
+        let mp = unescape_mount_path(mp);
+        active.insert(
+            mp,
+            Entry { fstype: fstype.to_owned(), root: unescape_mount_path(root), rw: !has_ro(mopts) && !has_ro(sopts) },
+        );
+    }
+    let mut found: Vec<(u8, PathBuf)> = active
+        .into_iter()
+        .filter(|(mp, e)| e.fstype == "cgroup2" && e.rw && mp != DATA && !mp.starts_with("/var/lib/kiri/"))
+        .map(|(mp, e)| {
+            let tier = if mp == "/sys/fs/cgroup" {
+                0
+            } else if mp == "/sys/fs/cgroup/unified" {
+                1
+            } else if mp.starts_with("/sys/fs/cgroup/") && e.root == "/" {
+                2
+            } else if e.root == "/" {
+                3
+            } else {
+                4
+            };
+            (tier, PathBuf::from(mp))
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Finds an already-mounted writable `cgroup2` hierarchy (unified
+/// `/sys/fs/cgroup`, stock WSL 2's `/sys/fs/cgroup/unified`, or another
+/// mountpoint), or mounts one when none is present yet.
+fn cgroup2_root() -> io::Result<PathBuf> {
+    let is_usable = |p: &std::path::Path| sys::is_cgroup2(p) && p.join("cgroup.controllers").exists();
+    let default = PathBuf::from("/sys/fs/cgroup");
+    if is_usable(&default) {
+        return Ok(default);
+    }
+    if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+        for cand in cgroup2_mounts(&mountinfo) {
+            if is_usable(&cand) {
+                return Ok(cand);
+            }
+        }
+    }
+    let unified = PathBuf::from("/sys/fs/cgroup/unified");
+    if is_usable(&unified) {
+        return Ok(unified);
+    }
+    mount_cgroup2(&default)
 }
 
 /// The cgroup containers go under on a Linux host, chosen as dockerd and
@@ -285,12 +443,17 @@ fn is_daemon(pid: libc::pid_t) -> bool {
 ///
 /// Started again from inside a `kiri-host` leaf (the daemon stays there
 /// when its agent restarts), it is not nested again.
-fn host_cgroup() -> io::Result<PathBuf> {
+///
+/// Returns `(cgroup_root, containers_cgroup)`. On a hybrid cgroup tree
+/// (stock WSL 2, where `/sys/fs/cgroup` is a tmpfs holding v1 mounts and
+/// `cgroup2` is at `/sys/fs/cgroup/unified`), `cgroup_root` is that
+/// `cgroup2` mountpoint rather than `/sys/fs/cgroup`.
+fn host_cgroup() -> io::Result<(PathBuf, PathBuf)> {
     let own = std::fs::read_to_string("/proc/self/cgroup")?;
-    let rel = own.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("/").trim().trim_start_matches('/').to_owned();
-    let root = PathBuf::from("/sys/fs/cgroup");
-    if !root.join("cgroup.controllers").exists() {
-        mount_cgroup2(&root)?;
+    let rel = cgroup2_rel(&own);
+    let root = cgroup2_root()?;
+    if root != std::path::Path::new("/sys/fs/cgroup") {
+        eprintln!("kiri-init: using cgroup v2 at {}", root.display());
     }
     let own = root.join(&rel);
     let mut base = own.clone();
@@ -314,18 +477,18 @@ fn host_cgroup() -> io::Result<PathBuf> {
         if root.join("cgroup.type").exists() {
             to_leaf(procs(&root));
         }
-        root
-    } else if delegated(&own, &procs(&own)) {
+        root.clone()
+    } else if own.is_dir() && delegated(&own, &procs(&own)) {
         if own != base.join("kiri-host") {
             to_leaf(procs(&own));
         }
         base
     } else {
-        root
+        root.clone()
     };
     let kiri = base.join("kiri");
     containers_cgroup(&kiri);
-    Ok(kiri)
+    Ok((root, kiri))
 }
 
 /// Makes the cgroup containers go under, with the controllers handed down
@@ -343,18 +506,54 @@ pub fn containers_cgroup(kiri: &std::path::Path) {
     }
 }
 
-/// `ip netns exec` mounts a fresh /sys for its network namespace, without
-/// the cgroup tree, and every container start then failed with ENOENT. An
-/// empty /sys/fs/cgroup gets cgroup2 mounted on it (in that command's
-/// private mount namespace, so nothing outside changes); anything else
-/// there (cgroup v1) fails the start now, saying why.
-fn mount_cgroup2(root: &std::path::Path) -> io::Result<()> {
-    let empty = std::fs::read_dir(root).map(|mut d| d.next().is_none());
-    match empty {
-        Ok(true) => mount(c"cgroup2", c"/sys/fs/cgroup", c"cgroup2", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None)
-            .map_err(|e| io::Error::new(e.kind(), format!("/sys/fs/cgroup has no cgroup tree (ip netns exec remounts /sys) and mounting cgroup2 there failed: {e}"))),
-        Ok(false) => Err(io::Error::new(io::ErrorKind::Unsupported, "Kiri needs cgroup v2 at /sys/fs/cgroup (this machine has cgroup v1 or a hybrid tree there)")),
-        Err(e) => Err(io::Error::new(e.kind(), format!("/sys/fs/cgroup: {e}; Kiri needs cgroup v2 mounted there"))),
+/// Mounts `cgroup2` when none is mounted yet:
+/// - An empty `/sys/fs/cgroup` (e.g. `ip netns exec` remounted a fresh `/sys`)
+///   gets `cgroup2` mounted directly on `/sys/fs/cgroup`.
+/// - A non-empty `/sys/fs/cgroup` (e.g. a cgroup v1 tree without
+///   `/sys/fs/cgroup/unified` mounted yet) leaves the existing v1 mounts
+///   untouched and mounts `cgroup2` at `/sys/fs/cgroup/unified`, falling back
+///   to `/run/kiri/cgroup` if `/sys/fs/cgroup` is not writable.
+fn mount_cgroup2(root: &std::path::Path) -> io::Result<PathBuf> {
+    let flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    let is_empty = |p: &std::path::Path| std::fs::read_dir(p).map(|mut d| d.next().is_none());
+    let try_mount = |target: &std::path::Path| -> io::Result<()> {
+        let t = sys::cstr(target)?;
+        mount(c"cgroup2", &t, c"cgroup2", flags, None)
+    };
+    match is_empty(root) {
+        Ok(true) => {
+            try_mount(root).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("/sys/fs/cgroup has no cgroup tree (ip netns exec remounts /sys) and mounting cgroup2 there failed: {e}"),
+                )
+            })?;
+            return Ok(root.to_path_buf());
+        }
+        Ok(false) => {}
+        Err(e) => {
+            return Err(io::Error::new(e.kind(), format!("/sys/fs/cgroup: {e}; Kiri needs cgroup v2 mounted there")));
+        }
+    }
+    let mut last_err = None;
+    for candidate in [root.join("unified"), PathBuf::from("/run/kiri/cgroup")] {
+        let _ = std::fs::create_dir_all(&candidate);
+        if is_empty(&candidate).unwrap_or(false) {
+            match try_mount(&candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(e) => last_err = Some((candidate, e)),
+            }
+        }
+    }
+    match last_err {
+        Some((p, e)) => Err(io::Error::new(
+            e.kind(),
+            format!("Kiri needs cgroup v2; no cgroup2 mount was found and mounting cgroup2 at {} failed: {e}", p.display()),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Kiri needs cgroup v2; no cgroup2 mount was found and neither /sys/fs/cgroup/unified nor /run/kiri/cgroup was available",
+        )),
     }
 }
 
@@ -366,7 +565,7 @@ fn delegated(own: &std::path::Path, pids: &[String]) -> bool {
         return true;
     }
     let (me, parent) = (std::process::id().to_string(), std::os::unix::process::parent_id().to_string());
-    pids.iter().all(|p| *p == me || *p == parent)
+    !pids.is_empty() && pids.iter().all(|p| *p == me || *p == parent)
 }
 
 /// Mounts the data disk (or a tmpfs without one), creates the layer and
@@ -377,9 +576,11 @@ fn data_dirs() -> io::Result<container::Paths> {
     // noinit_itable: the disk is made with lazy inode tables; zeroing them in
     // the background would only write gigabytes of zeros to the host.
     let disk = mount(c"/dev/vda", c"/var/lib/kiri", c"ext4", libc::MS_NOATIME, Some(c"noinit_itable"));
-    if let Err(e) = disk {
+    if let Err(ref e) = disk {
         eprintln!("kiri-init: no data disk ({e}); keeping images in memory");
         mount(c"kiri", c"/var/lib/kiri", c"tmpfs", libc::MS_NOATIME, Some(c"mode=0755"))?;
+    } else if let Err(e) = disk::grow() {
+        eprintln!("kiri-init: growing data disk: {e}");
     }
     // The Mac's filesystem over virtiofs, for bind mounts.
     sys::mkdir(c"/mnt", 0o755);
@@ -396,6 +597,7 @@ fn data_dirs() -> io::Result<container::Paths> {
         layers: root.join("layers"),
         containers: root.join("containers"),
         cgroup: PathBuf::from("/sys/fs/cgroup/kiri"),
+        cgroup_root: PathBuf::from("/sys/fs/cgroup"),
     };
     std::fs::create_dir_all(&paths.layers)?;
     std::fs::create_dir_all(&paths.containers)?;
@@ -412,6 +614,9 @@ fn data_dirs() -> io::Result<container::Paths> {
     }
     // Overlay lower dirs are given relative to the layer store.
     std::env::set_current_dir(&paths.layers)?;
+    if disk.is_ok() {
+        trim::start(DATA);
+    }
     Ok(paths)
 }
 
@@ -458,18 +663,49 @@ fn dial_host() -> io::Result<File> {
     Err(io::Error::new(last.kind(), format!("dial host: {last}")))
 }
 
-/// MemTotal and MemAvailable in KiB.
-fn meminfo() -> (u64, u64) {
-    let mut buf = [0u8; 2048];
-    let Ok(n) = File::open("/proc/meminfo").and_then(|mut f| f.read(&mut buf)) else { return (0, 0) };
-    let s = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+/// MemTotal, MemAvailable and (when the kernel reports it) Balloon in KiB.
+fn meminfo_full() -> (u64, u64, Option<u64>) {
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return (0, 0, None) };
+    let (total, avail, balloon) = parse_meminfo(&s);
+    // Older kernels without `Balloon:` in /proc/meminfo still expose
+    // balloon_inflate / balloon_deflate in /proc/vmstat inside the VM.
+    let balloon = balloon.or_else(|| (std::process::id() == 1).then(vmstat_balloon_kib).flatten());
+    (total, avail, balloon)
+}
+
+fn parse_meminfo(s: &str) -> (u64, u64, Option<u64>) {
     let field = |name: &str| {
         s.lines()
             .find_map(|l| l.strip_prefix(name))
             .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
-            .unwrap_or(0)
     };
-    (field("MemTotal:"), field("MemAvailable:"))
+    (field("MemTotal:").unwrap_or(0), field("MemAvailable:").unwrap_or(0), field("Balloon:"))
+}
+
+fn vmstat_balloon_kib() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/vmstat").ok()?;
+    // SAFETY: sysconf takes no pointers.
+    let page_kib = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64) >> 10;
+    parse_vmstat_balloon_kib(&s, page_kib)
+}
+
+fn parse_vmstat_balloon_kib(s: &str, page_kib: u64) -> Option<u64> {
+    let mut inflate = None;
+    let mut deflate = None;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("balloon_inflate ") {
+            inflate = v.trim().parse::<u64>().ok();
+        } else if let Some(v) = line.strip_prefix("balloon_deflate ") {
+            deflate = v.trim().parse::<u64>().ok();
+        }
+    }
+    Some(inflate?.saturating_sub(deflate?).saturating_mul(page_kib))
+}
+
+/// MemTotal and MemAvailable in KiB.
+fn meminfo() -> (u64, u64) {
+    let (total, avail, _) = meminfo_full();
+    (total, avail)
 }
 
 fn power_off() -> ! {
@@ -486,47 +722,161 @@ fn power_off() -> ! {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::os::fd::AsRawFd;
-
-    /// An agent gone without its daemon (a Kiri upgrade), whose children
-    /// that never reached their execve still hold its lock: the next agent
-    /// stops them and starts, rather than failing every 8 seconds.
+mod take_over_tests {
+    /// The agent that took the lock is gone but something it left (here a
+    /// child that inherited the locked descriptor and only waits) still
+    /// holds it: the leftovers are stopped once and the lock is taken,
+    /// where every new agent used to give up after 8 s.
     #[test]
-    fn a_dead_agents_children_holding_its_lock_give_way() {
+    fn a_lock_held_by_what_a_dead_agent_left_is_taken_over() {
+        use std::os::fd::AsRawFd;
         let root = std::env::temp_dir().join(format!("kiri-take-over-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        // SAFETY: a child that exits at once; its pid is then free.
-        let dead = match unsafe { libc::fork() } {
-            0 => unsafe { libc::_exit(0) },
-            pid => pid,
-        };
-        // SAFETY: reaping the child just forked.
-        unsafe { libc::waitpid(dead, std::ptr::null_mut(), 0) };
+        // The old agent: a process that has exited.
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let old = dead.id();
+        dead.wait().unwrap();
         let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(root.join("agent.lock")).unwrap();
-        std::fs::write(root.join("agent.lock"), format!("{dead}\n")).unwrap();
+        std::io::Write::write_all(&mut &lock, format!("{old}\n").as_bytes()).unwrap();
         // SAFETY: flock on a descriptor we own.
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
-        // SAFETY: the child only waits for a signal.
-        let child = match unsafe { libc::fork() } {
-            0 => loop {
+        // SAFETY: the child only waits to be killed.
+        let left = unsafe { libc::fork() };
+        if left == 0 {
+            loop {
+                // SAFETY: plain pause in the child.
                 unsafe { libc::pause() };
-            },
-            pid => pid,
-        };
-        drop(lock);
-
-        let started = std::time::Instant::now();
-        let taken = super::take_over(&root);
-        let mut status = 0;
-        // SAFETY: reaping the child forked above (killed by take_over, or here).
-        unsafe {
-            libc::kill(child, libc::SIGKILL);
-            libc::waitpid(child, &mut status, 0);
+            }
         }
+        drop(lock);
+        let swept = std::cell::Cell::new(0);
+        let t = std::time::Instant::now();
+        super::take_over(&root, || {
+            swept.set(swept.get() + 1);
+            // SAFETY: killing and reaping the child forked above.
+            unsafe {
+                libc::kill(left, libc::SIGKILL);
+                libc::waitpid(left, std::ptr::null_mut(), 0);
+            }
+        })
+        .unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "took {:?}", t.elapsed());
+        assert_eq!(swept.get(), 1);
+        let text = std::fs::read_to_string(root.join("agent.lock")).unwrap();
+        assert_eq!(text.trim(), std::process::id().to_string());
         let _ = std::fs::remove_dir_all(&root);
-        taken.unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod meminfo_tests {
+    #[test]
+    fn meminfo_reads_balloon_when_present() {
+        let with = "MemTotal:       24656160 kB\nMemFree:        24297640 kB\nMemAvailable:   24122580 kB\nBalloon:          262144 kB\n";
+        assert_eq!(super::parse_meminfo(with), (24_656_160, 24_122_580, Some(262_144)));
+        let zero = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\nBalloon:              0 kB\n";
+        assert_eq!(super::parse_meminfo(zero), (8_211_244, 8_000_000, Some(0)));
+        let without = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\n";
+        assert_eq!(super::parse_meminfo(without), (8_211_244, 8_000_000, None));
+    }
+
+    #[test]
+    fn vmstat_balloon_fallback_computes_net_kib() {
+        let vmstat = "nr_free_pages 100\nballoon_inflate 262144\nballoon_deflate 65536\n";
+        assert_eq!(super::parse_vmstat_balloon_kib(vmstat, 4), Some(196_608 * 4));
+        assert_eq!(super::parse_vmstat_balloon_kib("balloon_inflate 10\nballoon_deflate 20\n", 4), Some(0));
+        assert_eq!(super::parse_vmstat_balloon_kib("nr_free_pages 100\n", 4), None);
+    }
+}
+
+#[cfg(test)]
+mod cgroup_discovery_tests {
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn stock_wsl2_hybrid_mountinfo_picks_unified() {
+        let mountinfo = "\
+28 24 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,mode=755
+29 28 0:27 / /sys/fs/cgroup/unified rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate
+30 28 0:28 / /sys/fs/cgroup/cpuset rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw,cpuset
+31 28 0:29 / /sys/fs/cgroup/cpu rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw,cpu
+32 28 0:30 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw,memory
+33 28 0:31 / /sys/fs/cgroup/pids rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw,pids
+";
+        assert_eq!(super::cgroup2_mounts(mountinfo), vec![PathBuf::from("/sys/fs/cgroup/unified")]);
+    }
+
+    #[test]
+    fn overmounted_cgroup2_at_root_is_skipped_for_unified() {
+        // Simulates tmpfs stacked over an earlier /sys/fs/cgroup cgroup2 mount
+        // (as happens in a mount namespace or hybrid remount): only the active
+        // topmost mount per path counts.
+        let mountinfo = "\
+37 27 0:32 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:10 - cgroup2 cgroup2 rw,nsdelegate
+200 37 0:60 / /sys/fs/cgroup rw,relatime - tmpfs tmpfs rw,mode=755
+201 200 0:32 / /sys/fs/cgroup/unified rw,relatime - cgroup2 cgroup2 rw,nsdelegate
+";
+        assert_eq!(super::cgroup2_mounts(mountinfo), vec![PathBuf::from("/sys/fs/cgroup/unified")]);
+    }
+
+    #[test]
+    fn pure_v2_mount_is_preferred_over_secondary_mounts() {
+        let mountinfo = "\
+37 27 0:32 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate
+90 27 0:32 / /sys/fs/cgroup/unified rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate
+91 27 0:32 / /run/kiri/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw
+";
+        assert_eq!(
+            super::cgroup2_mounts(mountinfo),
+            vec![
+                PathBuf::from("/sys/fs/cgroup"),
+                PathBuf::from("/sys/fs/cgroup/unified"),
+                PathBuf::from("/run/kiri/cgroup"),
+            ]
+        );
+    }
+
+    #[test]
+    fn readonly_and_container_cgroup2_mounts_are_ignored() {
+        let mountinfo = "\
+40 28 0:27 / /sys/fs/cgroup/unified ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw
+41 28 0:27 / /sys/fs/cgroup/other rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 ro
+42 28 0:27 / /var/lib/kiri/containers/abc/rootfs/sys/fs/cgroup rw - cgroup2 cgroup2 rw
+43 28 0:27 / /run/kiri/cgroup rw,nosuid,nodev,noexec - cgroup2 cgroup2 rw
+";
+        assert_eq!(super::cgroup2_mounts(mountinfo), vec![PathBuf::from("/run/kiri/cgroup")]);
+    }
+
+    #[test]
+    fn mountinfo_octal_escapes_are_decoded() {
+        assert_eq!(super::unescape_mount_path(r"/mnt/my\040dir\134sub"), r"/mnt/my dir\sub");
+    }
+
+    #[test]
+    fn cgroup2_rel_parses_hybrid_proc_cgroup() {
+        let wsl_root = "15:name=systemd:/\n2:memory:/\n1:cpuset:/\n0::/\n";
+        assert_eq!(super::cgroup2_rel(wsl_root), "");
+        let systemd_hybrid = "12:memory:/system.slice/kiri.service\n0::/system.slice/kiri.service\n";
+        assert_eq!(super::cgroup2_rel(systemd_hybrid), "system.slice/kiri.service");
+    }
+
+    #[test]
+    fn delegated_requires_non_empty_pids_for_non_service_cgroup() {
+        assert!(!super::delegated(Path::new("/sys/fs/cgroup/unified/init.scope"), &[]));
+        assert!(super::delegated(Path::new("/sys/fs/cgroup/unified/system.slice/kiri.service"), &[]));
+        assert!(super::delegated(Path::new("/sys/fs/cgroup/unified/custom"), &[std::process::id().to_string()]));
+    }
+
+    #[test]
+    fn is_mounted_at_finds_exact_mountpoint() {
+        let mountinfo = "\
+28 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+55 28 8:2 /kiri/agent /var/lib/kiri rw,relatime - ext4 /dev/sdb1 rw
+56 28 8:2 /sub /var/lib/kiri/volumes/x rw,relatime - ext4 /dev/sdb1 rw
+";
+        assert!(super::is_mounted_at(mountinfo, Path::new("/var/lib/kiri")));
+        assert!(!super::is_mounted_at(mountinfo, Path::new("/var/lib")));
+        assert!(!super::is_mounted_at(mountinfo, Path::new("/media/ssd")));
     }
 }

@@ -2,24 +2,55 @@
 //! `docker update`), freezing (`docker pause`), and what `docker stats` and
 //! `docker top` read.
 
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 
 use kiri_proto::{ContainerStats, Limits};
 
 use super::sys;
 
+/// Writes a single cgroup v2 control file without `O_CREAT`: on kernfs,
+/// `O_CREAT` against a missing control file fails with `EACCES` instead of
+/// `ENOENT`. When a controller is held by cgroup v1 (stock WSL 2 hybrid
+/// tree) or not delegated to this cgroup, its control files do not exist;
+/// skip them instead of failing container start, and note when an explicit
+/// limit could not be applied.
+fn write_control(dir: &Path, file: &str, value: &str, requested: bool) -> io::Result<()> {
+    match OpenOptions::new().write(true).truncate(true).open(dir.join(file)) {
+        Ok(mut f) => f.write_all(value.as_bytes()).map_err(|e| io::Error::new(e.kind(), format!("{file}: {e}"))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if requested {
+                eprintln!("kiri-init: {file} unavailable in this cgroup v2 hierarchy (controller held by cgroup v1 or not delegated); skipping limit");
+            }
+            Ok(())
+        }
+        Err(e) => Err(io::Error::new(e.kind(), format!("{file}: {e}"))),
+    }
+}
+
 /// Writes the limits into the cgroup. Zero fields mean "no limit".
 pub fn apply_limits(dir: &Path, l: &Limits) -> io::Result<()> {
-    let write = |file: &str, value: String| fs::write(dir.join(file), value).map_err(|e| io::Error::new(e.kind(), format!("{file}: {e}")));
-    write("memory.max", if l.memory_max == 0 { "max".into() } else { l.memory_max.to_string() })?;
-    // No swap in the VM: a limit is a limit.
-    let _ = fs::write(dir.join("memory.swap.max"), "0");
+    if !dir.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("{}: cgroup directory not found", dir.display())));
+    }
+    let mem = if l.memory_max == 0 { "max".into() } else { l.memory_max.to_string() };
+    write_control(dir, "memory.max", &mem, l.memory_max != 0)?;
+    // Docker's `--memory-swap`, worked out by the daemon. The VM has no swap,
+    // so it matters on a Linux host, which may. A kernel without swap or a
+    // hybrid cgroup tree without the memory controller has no such file; open
+    // without `O_CREAT` so we never create fake files or hit kernfs `EACCES`.
+    if let Ok(mut f) = OpenOptions::new().write(true).truncate(true).open(dir.join("memory.swap.max")) {
+        let swap = if l.swap_max == kiri_proto::NO_LIMIT { "max".into() } else { l.swap_max.to_string() };
+        let _ = f.write_all(swap.as_bytes());
+    }
     let period = if l.cpu_period == 0 { 100_000 } else { l.cpu_period };
-    write("cpu.max", if l.cpu_quota == 0 { format!("max {period}") } else { format!("{} {period}", l.cpu_quota) })?;
-    write("cpu.weight", if l.cpu_weight == 0 { "100".into() } else { l.cpu_weight.clamp(1, 10_000).to_string() })?;
-    write("pids.max", if l.pids_max == 0 { "max".into() } else { l.pids_max.to_string() })?;
+    let cpu_max = if l.cpu_quota == 0 { format!("max {period}") } else { format!("{} {period}", l.cpu_quota) };
+    write_control(dir, "cpu.max", &cpu_max, l.cpu_quota != 0)?;
+    let cpu_weight = if l.cpu_weight == 0 { "100".into() } else { l.cpu_weight.clamp(1, 10_000).to_string() };
+    write_control(dir, "cpu.weight", &cpu_weight, l.cpu_weight != 0)?;
+    let pids = if l.pids_max == 0 { "max".into() } else { l.pids_max.to_string() };
+    write_control(dir, "pids.max", &pids, l.pids_max != 0)?;
     Ok(())
 }
 
@@ -36,8 +67,20 @@ pub fn freeze(dir: &Path, frozen: bool) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::TimedOut, "the container did not freeze in time"))
 }
 
+fn keyed_opt(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix(' '))).and_then(|v| v.trim().parse().ok())
+}
+
 fn keyed(text: &str, key: &str) -> u64 {
-    text.lines().find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix(' '))).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    keyed_opt(text, key).unwrap_or(0)
+}
+
+/// CPU throttling counters from `cpu.stat`: `(nr_periods, nr_throttled, throttled_usec)`.
+/// cgroup v2 reports `throttled_usec` in microseconds; cgroup v1 reports
+/// `throttled_time` in nanoseconds.
+fn cpu_throttling(cpu_stat: &str) -> (u64, u64, u64) {
+    let throttled_usec = keyed_opt(cpu_stat, "throttled_usec").unwrap_or_else(|| keyed(cpu_stat, "throttled_time") / 1000);
+    (keyed(cpu_stat, "nr_periods"), keyed(cpu_stat, "nr_throttled"), throttled_usec)
 }
 
 /// What the cgroup holds and cannot give back, in bytes: anonymous, shared
@@ -83,6 +126,7 @@ pub fn stats(dir: &Path, pid: libc::pid_t) -> io::Result<ContainerStats> {
     let read = |f: &str| fs::read_to_string(dir.join(f)).unwrap_or_default();
     let cpu = read("cpu.stat");
     let mem_stat = read("memory.stat");
+    let (cpu_periods, cpu_throttled_periods, cpu_throttled_usec) = cpu_throttling(&cpu);
     let mut s = ContainerStats {
         read_ns: sys::boottime_ns(),
         mem_current: read("memory.current").trim().parse().unwrap_or(0),
@@ -91,6 +135,9 @@ pub fn stats(dir: &Path, pid: libc::pid_t) -> io::Result<ContainerStats> {
         cpu_usage_usec: keyed(&cpu, "usage_usec"),
         cpu_user_usec: keyed(&cpu, "user_usec"),
         cpu_system_usec: keyed(&cpu, "system_usec"),
+        cpu_periods,
+        cpu_throttled_periods,
+        cpu_throttled_usec,
         pids: read("pids.current").trim().parse().unwrap_or(0),
         // SAFETY: sysconf has no preconditions.
         online_cpus: unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u32,
@@ -142,13 +189,20 @@ fn pids(dir: &Path, out: &mut Vec<libc::pid_t>) {
     }
 }
 
-/// `docker top`: one tab-separated line per process, ps -ef style.
+/// `docker top`: one tab-separated line per process. The first seven fields
+/// are `ps -ef`'s (user pid ppid c stime tty time); then what other `ps_args`
+/// columns need (comm stat rss-KiB vsz-KiB %cpu %mem elapsed-secs cpu-secs
+/// uid, then `-l`'s F, kernel priority, nice and SZ in pages); the command
+/// line last. The host picks and formats the columns.
 pub fn top(dir: &Path) -> Vec<String> {
     let mut list = Vec::new();
     pids(dir, &mut list);
     list.sort_unstable();
     // SAFETY: sysconf has no preconditions.
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    // SAFETY: as above.
+    let page_kib = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1024) as u64) / 1024;
+    let mem_kib = super::meminfo().0.max(1);
     let uptime_secs: f64 = fs::read_to_string("/proc/uptime").ok().and_then(|u| u.split_whitespace().next()?.parse().ok()).unwrap_or(0.0);
     let boot_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0) - uptime_secs;
     let mut out = Vec::with_capacity(list.len());
@@ -157,25 +211,28 @@ pub fn top(dir: &Path) -> Vec<String> {
         // The command name is in parentheses and may hold spaces.
         let Some(close) = stat.rfind(')') else { continue };
         let f: Vec<&str> = stat[close + 2..].split_whitespace().collect();
-        if f.len() < 20 {
+        if f.len() < 22 {
             continue;
         }
+        let num = |i: usize| f[i].parse::<i64>().unwrap_or(0);
         let ppid = f[1];
-        let tty_nr: u32 = f[4].parse().unwrap_or(0);
-        let ticks = f[11].parse::<u64>().unwrap_or(0) + f[12].parse::<u64>().unwrap_or(0);
-        let start_ticks: u64 = f[19].parse().unwrap_or(0);
+        let tty_nr = num(4) as u32;
+        let ticks = (num(11) + num(12)).max(0) as u64;
+        let start_ticks = num(19).max(0) as u64;
         let started = boot_unix + start_ticks as f64 / hz as f64;
         let elapsed = (uptime_secs - start_ticks as f64 / hz as f64).max(0.01);
-        let c = ((ticks as f64 / hz as f64) / elapsed * 100.0) as u64;
+        let cpu = (ticks as f64 / hz as f64) / elapsed * 100.0;
+        let c = cpu as u64;
         let uid = fs::read_to_string(format!("/proc/{pid}/status"))
             .ok()
             .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:").and_then(|v| v.split_whitespace().next().map(str::to_owned))))
             .unwrap_or_default();
-        let user = if uid == "0" { "root".to_owned() } else { uid };
+        let user = if uid == "0" { "root".to_owned() } else { uid.clone() };
+        let comm = stat[stat.find('(').map_or(0, |i| i + 1)..close].replace('\t', " ");
         let cmd = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        let mut cmd = String::from_utf8_lossy(&cmd).replace('\0', " ").trim().to_owned();
+        let mut cmd = String::from_utf8_lossy(&cmd).replace(['\0', '\t'], " ").trim().to_owned();
         if cmd.is_empty() {
-            cmd = format!("[{}]", &stat[stat.find('(').map_or(0, |i| i + 1)..close]);
+            cmd = format!("[{comm}]");
         }
         let secs = ticks / hz;
         let time = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
@@ -185,7 +242,40 @@ pub fn top(dir: &Path) -> Vec<String> {
             format!("{:02}:{:02}", day / 3600, day / 60 % 60)
         };
         let tty = if tty_nr == 0 { "?".to_owned() } else { format!("pts/{}", tty_nr & 0xff) };
-        out.push(format!("{user}\t{pid}\t{ppid}\t{c}\t{stime}\t{tty}\t{time}\t{cmd}"));
+        // ps's STAT: the state, then < or N (nice), s (session leader), l
+        // (threads), + (foreground).
+        let mut stat_col = f[0].to_owned();
+        let nice = num(16);
+        if nice < 0 {
+            stat_col.push('<');
+        } else if nice > 0 {
+            stat_col.push('N');
+        }
+        if num(3) == pid as i64 {
+            stat_col.push('s');
+        }
+        if num(17) > 1 {
+            stat_col.push('l');
+        }
+        if num(5) > 0 && num(5) == num(2) {
+            stat_col.push('+');
+        }
+        let rss = num(21).max(0) as u64 * page_kib;
+        let vsz = num(20).max(0) as u64 / 1024;
+        let mem = rss as f64 * 100.0 / mem_kib as f64;
+        // ps's F: forked but not exec'd (1), used superuser privileges (4).
+        let flags = (f[6].parse::<u64>().unwrap_or(0) >> 6) & 7;
+        let prio = num(15);
+        // ps prints no nice value for a real-time policy (not OTHER or BATCH).
+        let ni = match f.get(38).map(|p| p.parse::<i64>().unwrap_or(0)) {
+            Some(p) if p != 0 && p != 3 => "-".to_owned(),
+            _ => nice.to_string(),
+        };
+        let sz = vsz / page_kib;
+        out.push(format!(
+            "{user}\t{pid}\t{ppid}\t{c}\t{stime}\t{tty}\t{time}\t{comm}\t{stat_col}\t{rss}\t{vsz}\t{cpu:.1}\t{mem:.1}\t{}\t{secs}\t{uid}\t{flags}\t{prio}\t{ni}\t{sz}\t{cmd}",
+            elapsed as u64
+        ));
     }
     out
 }
@@ -205,5 +295,95 @@ mod tests {
     fn oom_kills_come_from_their_line() {
         assert_eq!(keyed("low 0\nhigh 0\nmax 3\noom 2\noom_kill 1\noom_group_kill 0\n", "oom_kill"), 1);
         assert_eq!(keyed("pgfault 9\noom_kill 0\n", "oom_kill"), 0);
+    }
+
+    fn temp_cgroup(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kiri-cg-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn apply_limits_writes_all_files_when_controllers_exist() {
+        let dir = temp_cgroup("all");
+        for f in ["memory.max", "memory.swap.max", "cpu.max", "cpu.weight", "pids.max"] {
+            fs::write(dir.join(f), "").unwrap();
+        }
+        let lim = Limits { memory_max: 67_108_864, cpu_quota: 50_000, cpu_period: 100_000, cpu_weight: 250, pids_max: 64, shm_size: 0, swap_max: 67_108_864 };
+        apply_limits(&dir, &lim).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("memory.max")).unwrap(), "67108864");
+        assert_eq!(fs::read_to_string(dir.join("memory.swap.max")).unwrap(), "67108864");
+        assert_eq!(fs::read_to_string(dir.join("cpu.max")).unwrap(), "50000 100000");
+        assert_eq!(fs::read_to_string(dir.join("cpu.weight")).unwrap(), "250");
+        assert_eq!(fs::read_to_string(dir.join("pids.max")).unwrap(), "64");
+
+        // Zero swap (`--memory-swap == --memory`) and unlimited swap (`-1`).
+        apply_limits(&dir, &Limits { swap_max: 0, ..lim }).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("memory.swap.max")).unwrap(), "0");
+        apply_limits(&dir, &Limits { swap_max: kiri_proto::NO_LIMIT, ..lim }).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("memory.swap.max")).unwrap(), "max");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_limits_skips_missing_controllers_on_hybrid_tree() {
+        // Hybrid cgroup v2 directory whose controllers are bound to v1: none of
+        // memory.max, memory.swap.max, cpu.max, cpu.weight or pids.max exist.
+        let dir = temp_cgroup("hybrid");
+        let lim = Limits { memory_max: 67_108_864, cpu_quota: 50_000, cpu_period: 100_000, cpu_weight: 250, pids_max: 64, shm_size: 134_217_728, swap_max: 67_108_864 };
+        apply_limits(&dir, &lim).unwrap();
+        // OpenOptions without O_CREAT must not create fake files either.
+        assert!(!dir.join("memory.max").exists());
+        assert!(!dir.join("memory.swap.max").exists());
+        assert!(!dir.join("cpu.max").exists());
+        assert!(!dir.join("pids.max").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_limits_skips_missing_swap_file_when_memory_exists() {
+        // Kernel without swap accounting (or VM kernel with no swap): memory.max
+        // exists, memory.swap.max does not.
+        let dir = temp_cgroup("no-swap");
+        fs::write(dir.join("memory.max"), "").unwrap();
+        let lim = Limits { memory_max: 67_108_864, swap_max: 33_554_432, ..Default::default() };
+        apply_limits(&dir, &lim).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("memory.max")).unwrap(), "67108864");
+        assert!(!dir.join("memory.swap.max").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_limits_writes_available_subset_of_controllers() {
+        let dir = temp_cgroup("subset");
+        fs::write(dir.join("pids.max"), "").unwrap();
+        let lim = Limits { memory_max: 67_108_864, pids_max: 32, ..Default::default() };
+        apply_limits(&dir, &lim).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("pids.max")).unwrap(), "32");
+        assert!(!dir.join("memory.max").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpu_throttling_reads_v2_and_v1_formats() {
+        let v2 = "usage_usec 12345\nuser_usec 10000\nsystem_usec 2345\nnr_periods 12\nnr_throttled 5\nthrottled_usec 43210\n";
+        assert_eq!(cpu_throttling(v2), (12, 5, 43_210));
+
+        let v2_zero = "usage_usec 500\nnr_periods 4\nnr_throttled 0\nthrottled_usec 0\n";
+        assert_eq!(cpu_throttling(v2_zero), (4, 0, 0));
+
+        let v1 = "nr_periods 12\nnr_throttled 5\nthrottled_time 43210000\n";
+        assert_eq!(cpu_throttling(v1), (12, 5, 43_210));
+
+        assert_eq!(cpu_throttling(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn apply_limits_errors_when_cgroup_dir_is_missing() {
+        let missing = std::env::temp_dir().join(format!("kiri-cg-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        let err = apply_limits(&missing, &Limits { memory_max: 67_108_864, ..Default::default() }).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }

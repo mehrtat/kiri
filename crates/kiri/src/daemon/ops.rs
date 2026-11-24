@@ -35,7 +35,7 @@ pub fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream) -> Option<
                 let (id, action) = rest.split_once('/')?;
                 return Some(match (m, action) {
                     ("GET", "stats") => stats(req, engine, id, w),
-                    ("GET", "top") => reply(w, top(engine, id), 200),
+                    ("GET", "top") => reply(w, top(req, engine, id), 200),
                     ("POST", "pause") => reply(w, engine.pause(id, true).map(|()| Value::Null), 204),
                     ("POST", "unpause") => reply(w, engine.pause(id, false).map(|()| Value::Null), 204),
                     ("POST", "rename") => reply(w, engine.rename(id, req.query("name").unwrap_or_default()).map(|()| Value::Null), 204),
@@ -78,7 +78,11 @@ fn stats_json(id: &str, name: &str, s: &kiri_proto::ContainerStats, pre: Option<
             "cpu_usage": {"total_usage": s.cpu_usage_usec * 1000, "usage_in_kernelmode": s.cpu_system_usec * 1000, "usage_in_usermode": s.cpu_user_usec * 1000},
             "system_cpu_usage": s.system_ticks * TICK_NS,
             "online_cpus": s.online_cpus,
-            "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0},
+            "throttling_data": {
+                "periods": s.cpu_periods,
+                "throttled_periods": s.cpu_throttled_periods,
+                "throttled_time": s.cpu_throttled_usec.saturating_mul(1000),
+            },
         })
     };
     let read = time::rfc3339(std::time::SystemTime::now());
@@ -138,16 +142,16 @@ fn stats(req: &Request, engine: &Engine, key: &str, w: &mut UnixStream) -> io::R
     Ok(Next::KeepAlive)
 }
 
-fn top(engine: &Engine, key: &str) -> Result<Value, Error> {
-    let lines = engine.top(key)?;
-    let procs: Vec<Vec<&str>> = lines.iter().map(|l| l.splitn(8, '\t').collect()).collect();
-    Ok(json!({"Titles": ["UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"], "Processes": procs}))
+fn top(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {
+    let ps_args = req.query("ps_args").unwrap_or_default();
+    super::top::check(ps_args)?;
+    super::top::answer(ps_args, &engine.top(key)?)
 }
 
 fn update(req: &Request, engine: &Engine, key: &str) -> Result<Value, Error> {
     let b = body(req)?;
     let base = engine.with(key, |c| c.spec.limits)?;
-    let limits = super::api::limits_from(&b, base);
+    let limits = super::api::limits_from(&b, base)?;
     let restart = b["RestartPolicy"]["Name"].as_str().filter(|n| !n.is_empty()).map(|n| super::engine::RestartPolicy {
         name: n.to_owned(),
         max_retries: b["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0) as u32,
@@ -278,6 +282,9 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     cfg["config"]["Env"] = json!(spec.env);
     cfg["config"]["WorkingDir"] = spec.cwd.clone().into();
     cfg["config"]["User"] = spec.user.clone().into();
+    if spec.labels.is_object() {
+        cfg["config"]["Labels"] = spec.labels.clone();
+    }
     if let Some(h) = &spec.healthcheck {
         cfg["config"]["Healthcheck"] = h.to_json();
     }
@@ -337,37 +344,41 @@ fn commit(req: &Request, engine: &Engine) -> Result<Value, Error> {
     };
     let image = kiri_image::archive::from_config(name, &config_digest, &cfg, layers);
     engine.store.put_image(image)?;
+    engine.prune_layers();
     engine.emit_container("commit", &id, &[]);
     Ok(json!({"Id": config_digest}))
 }
 
-fn until_ok(f: &super::filters::Filters, t: std::time::SystemTime) -> bool {
-    f.any("until", |v| {
-        let secs = time::unix(t);
-        match v.parse::<f64>() {
-            Ok(u) => (secs as f64) < u,
-            Err(_) => parse_duration(v).is_some_and(|d| t.elapsed().is_ok_and(|age| age >= d)),
-        }
-    })
+/// A prune's `until` filter, as Docker's daemon reads it (moby
+/// `getUntilFromPruneFilters`): one value, a duration, date or Unix time
+/// (see `time::docker_timestamp`); anything else is refused, never ignored.
+/// The cut-off in Unix seconds: only what was created at or before it goes.
+pub(super) fn prune_until(f: &super::filters::Filters, key: &str) -> Result<Option<f64>, Error> {
+    let Some(v) = f.values(key) else { return Ok(None) };
+    let mut v = v.to_vec();
+    v.sort();
+    v.dedup();
+    if v.len() > 1 {
+        return Err(Error::BadRequest(format!("more than one {key} filter specified")));
+    }
+    match time::docker_timestamp(&v[0], std::time::SystemTime::now()) {
+        Some(t) => Ok(Some(t)),
+        None => Err(Error::BadRequest(format!("failed to parse value as time or duration: {:?}", v[0]))),
+    }
 }
 
-/// `10m`, `24h`, `30s`.
-fn parse_duration(s: &str) -> Option<Duration> {
-    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
-    let n: u64 = n.parse().ok()?;
-    Some(Duration::from_secs(match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        _ => return None,
-    }))
+/// Created at or before the `until` cut-off (Docker skips what was created after it).
+pub(super) fn before(until: Option<f64>, created_secs: f64) -> bool {
+    until.is_none_or(|u| created_secs <= u)
 }
 
 fn container_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let f = filters(req, &["until", "label", "label!"])?;
+    let until = prune_until(&f, "until")?;
     let doomed = engine.each(|c| {
         let labels = if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) };
-        (c.status != Status::Running && f.labels(&labels) && until_ok(&f, c.created)).then(|| c.id.clone())
+        let created = c.created.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        (c.status != Status::Running && f.labels(&labels) && before(until, created)).then(|| c.id.clone())
     });
     let mut deleted = Vec::new();
     for id in doomed {
@@ -387,11 +398,21 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let f = filters(req, &["dangling", "until", "label", "label!"])?;
     // Without `-a` only untagged images go; Kiri keeps none of those around.
     let dangling_only = f.bool("dangling").unwrap_or(true);
+    let until = prune_until(&f, "until")?;
     let used: Vec<String> = engine.each(|c| Some(c.spec.image_id.clone()));
     let mut deleted = Vec::new();
+    let mut any_deleted = false;
     let mut reclaimed = 0u64;
     for i in engine.store.images()? {
         if used.contains(&i.config_digest) || (dangling_only && !i.name.starts_with("sha256:")) {
+            continue;
+        }
+        // Docker's rules (moby daemon/images/image_prune.go): the image
+        // config's labels must match `label` and not `label!`, and with
+        // `until` an image without a creation time stays.
+        let cfg = super::api::image_config_json(engine, &i.config_digest);
+        let created = cfg["created"].as_str().and_then(|c| time::docker_timestamp(c, std::time::SystemTime::now()));
+        if !f.labels(&super::api::image_labels_from(&cfg)) || (until.is_some() && !created.is_some_and(|c| before(until, c))) {
             continue;
         }
         if engine.store.remove_image(&i.name)?.is_some() {
@@ -399,10 +420,14 @@ fn image_prune(req: &Request, engine: &Engine) -> Result<Value, Error> {
             deleted.push(json!({"Untagged": i.name}));
             engine.emit_image("untag", &i.config_digest, &i.name);
             if !engine.store.images()?.iter().any(|o| o.config_digest == i.config_digest) {
+                any_deleted = true;
                 deleted.push(json!({"Deleted": i.config_digest}));
                 engine.emit_image("delete", &i.config_digest, &i.name);
             }
         }
+    }
+    if any_deleted {
+        engine.prune_layers();
     }
     Ok(json!({"ImagesDeleted": if deleted.is_empty() { Value::Null } else { Value::Array(deleted) }, "SpaceReclaimed": reclaimed}))
 }
@@ -456,16 +481,18 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
     }
     // Every image layer once, as `layer_size` counts it; with the guest's
     // numbers, plus the rest of the layer store: layers only stopped
-    // containers still use, and leftovers the next VM start clears.
+    // containers still use, and any leftovers the next VM start clears.
     let mut seen = HashSet::new();
     let mut layers_size: u64 = images.iter().flat_map(|i| &i.layers).filter(|l| seen.insert(l.digest.trim_start_matches("sha256:"))).map(layer_size).sum();
     if let Some(d) = &du {
         layers_size += d.layers.iter().filter(|(hex, _)| !seen.contains(hex.as_str())).map(|(_, b)| b).sum::<u64>();
     }
     let image_size = |i: &kiri_image::Image| -> u64 { i.layers.iter().map(layer_size).sum() };
+    let labels = engine.image_labels(&images);
     let image_rows: Vec<Value> = images
         .iter()
-        .map(|i| {
+        .zip(labels)
+        .map(|(i, labels)| {
             let size = image_size(i);
             let shared: u64 = i.layers.iter().filter(|l| users.get(l.digest.as_str()).is_some_and(|n| *n > 1)).map(layer_size).sum();
             json!({
@@ -477,7 +504,7 @@ fn system_df(engine: &Engine) -> Result<Value, Error> {
                 "Size": size,
                 "SharedSize": shared,
                 "VirtualSize": size,
-                "Labels": null,
+                "Labels": labels,
                 "Containers": used.iter().filter(|u| **u == i.config_digest).count(),
             })
         })
@@ -683,7 +710,7 @@ mod disk_usage_tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("containers.json.corrupt-1-0"), b"[{\"id\":").unwrap();
         let engine = super::super::engine::boot_without_vm(&root);
-        let image = kiri_image::Image {
+        let image = kiri_image::Image { mirror: None,
             name: "sha256:0123".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
@@ -697,6 +724,75 @@ mod disk_usage_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Image prune keeps what Docker keeps: an image's config labels must
+    /// match `label` and not `label!`, and `until` keeps newer images.
+    #[test]
+    fn image_prune_follows_labels_and_until() {
+        use super::{Error, Request};
+        use serde_json::{Value, json};
+        let root = std::env::temp_dir().join(format!("kiri-image-prune-labels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let mut ids = Vec::new();
+        for (tag, created, labels) in [(None, "2026-11-16T00:00:00Z", json!({"keep": "1"})), (None, "2020-01-01T00:00:00Z", Value::Null), (Some("tagged:1"), "2020-01-01T00:00:00Z", Value::Null)] {
+            let cfg = json!({"created": created, "architecture": "arm64", "os": "linux", "config": {"Labels": labels}});
+            let mut w = engine.store.ingest().unwrap();
+            std::io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+            let (digest, _) = w.finish().unwrap();
+            engine.store.put_image(kiri_image::archive::from_config(tag.map_or(digest.clone(), str::to_owned), &digest, &cfg, Vec::new())).unwrap();
+            ids.push(digest);
+        }
+        let prune = |f: &str| super::image_prune(&Request::internal("POST", "/images/prune", &[("filters", f)], Vec::new()), &engine);
+        let names = || -> Vec<String> { engine.store.images().unwrap().into_iter().map(|i| i.name).collect() };
+        let left = |want: &[&str]| {
+            let mut got = names();
+            got.sort();
+            let mut want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want);
+        };
+        let (keep, old) = (ids[0].as_str(), ids[1].as_str());
+        prune(r#"{"label":["nope=1"]}"#).unwrap();
+        left(&[keep, old, "tagged:1"]);
+        prune(r#"{"dangling":["false"],"label":["nope=1"]}"#).unwrap();
+        left(&[keep, old, "tagged:1"]);
+        assert!(matches!(prune(r#"{"until":["someday"]}"#), Err(Error::BadRequest(_))));
+        assert!(matches!(prune(r#"{"until":["1h","2h"]}"#), Err(Error::BadRequest(_))));
+        prune(r#"{"until":["2021-01-01T00:00:00Z"]}"#).unwrap();
+        left(&[keep, "tagged:1"]);
+        prune(r#"{"label!":["keep=1"]}"#).unwrap();
+        left(&[keep, "tagged:1"]);
+        prune(r#"{"label":["keep=1"]}"#).unwrap();
+        left(&["tagged:1"]);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `system df` image rows carry the image's labels, and `{}` (not
+    /// `null`) for an image without any, as Docker's do.
+    #[test]
+    fn system_df_image_rows_carry_labels() {
+        use serde_json::{Value, json};
+        let root = std::env::temp_dir().join(format!("kiri-df-labels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        for (name, labels) in [("demo:labeled", json!({"maintainer": "someone"})), ("demo:plain", Value::Null)] {
+            let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Labels": labels}});
+            let mut w = engine.store.ingest().unwrap();
+            std::io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+            let (digest, _) = w.finish().unwrap();
+            engine.store.put_image(kiri_image::archive::from_config(name.into(), &digest, &cfg, Vec::new())).unwrap();
+        }
+        let df = super::system_df(&engine).unwrap();
+        let row = |name: &str| df["Images"].as_array().unwrap().iter().find(|r| r["RepoTags"][0] == name).unwrap()["Labels"].clone();
+        assert_eq!(row("demo:labeled"), json!({"maintainer": "someone"}));
+        assert_eq!(row("demo:plain"), json!({}));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn reads_each_kind_and_skips_bad_lines() {
         let lines: Vec<String> = ["l ab12 4096", "c c1 8192", "v data 12288", "v bad", "x odd 1", "l cd34 notanumber", "c c2 1 extra"].map(str::to_owned).to_vec();
@@ -705,5 +801,41 @@ mod disk_usage_tests {
         assert_eq!(du.containers.get("c1"), Some(&8192));
         assert_eq!(du.volumes.get("data"), Some(&12288));
         assert_eq!((du.layers.len(), du.containers.len(), du.volumes.len()), (1, 1, 1));
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::stats_json;
+    use kiri_proto::ContainerStats;
+    use serde_json::json;
+
+    #[test]
+    fn throttling_data_matches_cgroup_counters_in_docker_units() {
+        let prev = ContainerStats {
+            cpu_periods: 4,
+            cpu_throttled_periods: 2,
+            cpu_throttled_usec: 1000,
+            ..Default::default()
+        };
+        let sample = ContainerStats {
+            cpu_periods: 11,
+            cpu_throttled_periods: 9,
+            cpu_throttled_usec: 4321,
+            ..Default::default()
+        };
+        let value = stats_json("id", "work", &sample, Some(&prev), 0);
+        assert_eq!(
+            value["cpu_stats"]["throttling_data"],
+            json!({
+                "periods": 11, "throttled_periods": 9, "throttled_time": 4_321_000,
+            })
+        );
+        assert_eq!(
+            value["precpu_stats"]["throttling_data"],
+            json!({
+                "periods": 4, "throttled_periods": 2, "throttled_time": 1_000_000,
+            })
+        );
     }
 }
