@@ -45,6 +45,16 @@ pub fn may_rebuild(on: bool, kiri_linux: bool, free: Option<u64>, last: Option<u
     on && kiri_linux && free.is_some_and(|f| f >= LOW_FREE) && last.is_none_or(|at| now.saturating_sub(at) >= REBUILD_EVERY)
 }
 
+/// Where setup puts Kiri Linux's disk: `<root>Kiri\wsl` on the drive with
+/// the most room among `drives` (each usable drive's root, `D:\`, and its
+/// free bytes), when that is more than `local` (the drive %LOCALAPPDATA%
+/// is on) has; None keeps it in %LOCALAPPDATA%\Kiri\wsl. The disk grows
+/// with every image and build, and a full drive damages it.
+pub fn roomiest(local: &str, drives: &[(String, u64)]) -> Option<String> {
+    let here = drives.iter().find(|(d, _)| d.eq_ignore_ascii_case(local)).map_or(0, |(_, f)| *f);
+    drives.iter().filter(|(d, f)| *f > here && !d.eq_ignore_ascii_case(local)).max_by_key(|(_, f)| *f).map(|(d, _)| format!("{d}Kiri\\wsl"))
+}
+
 /// The line the boot log gets once a rebuild worked, for scripts to match.
 pub fn rebuilt_line(why: &str) -> String {
     format!("engine: Linux disk rebuilt after failure: {why}")
@@ -71,7 +81,7 @@ pub fn not_started(said: &str, distro: &str, drive: Option<(&str, u64)>) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{failed, low_notice, may_rebuild, not_started, reason, rebuilt_line, LOW_FREE, REBUILD_EVERY};
+    use super::{failed, low_notice, may_rebuild, not_started, reason, rebuilt_line, roomiest, LOW_FREE, REBUILD_EVERY};
 
     #[test]
     fn each_disk_failure_is_seen() {
@@ -129,5 +139,16 @@ mod tests {
         assert!(!may_rebuild(true, true, Some(LOW_FREE - 1), None, now), "a full drive fails a rebuild too");
         assert!(!may_rebuild(true, true, None, None, now), "room unknown");
         assert!(!may_rebuild(true, true, Some(LOW_FREE), Some(now - 60), now), "rebuilt a minute ago");
+    }
+
+    #[test]
+    fn kiri_linux_goes_on_the_drive_with_the_most_room() {
+        let d = |v: &[(&str, u64)]| v.iter().map(|(r, f)| ((*r).to_owned(), *f)).collect::<Vec<_>>();
+        assert_eq!(roomiest("C:\\", &d(&[("C:\\", 20), ("D:\\", 400)])).as_deref(), Some("D:\\Kiri\\wsl"));
+        assert_eq!(roomiest("C:\\", &d(&[("C:\\", 400), ("D:\\", 20)])), None, "C: has more");
+        assert_eq!(roomiest("c:\\", &d(&[("C:\\", 20), ("D:\\", 20)])), None, "a tie stays on C:");
+        assert_eq!(roomiest("C:\\", &d(&[("C:\\", 20)])), None);
+        assert_eq!(roomiest("C:\\", &d(&[("C:\\", 20), ("D:\\", 100), ("E:\\", 300)])).as_deref(), Some("E:\\Kiri\\wsl"));
+        assert_eq!(roomiest("C:\\", &[]), None, "none known");
     }
 }
