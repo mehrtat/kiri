@@ -18,8 +18,36 @@ pub fn low_notice(drive: &str, free: u64) -> String {
 /// Whether what wsl.exe said, starting the engine, means the distro's disk
 /// failed.
 pub fn failed(said: &str) -> bool {
-    ["WSL_E_USER_NOT_FOUND", "Read-only file system", "Input/output error"].iter().any(|s| said.contains(s))
-        || (said.contains("getpwnam(") && said.contains("failed 5"))
+    reason(said).is_some()
+}
+
+/// The sign in what wsl.exe said that the distro's disk failed, if any.
+pub fn reason(said: &str) -> Option<&'static str> {
+    if said.contains("getpwnam(") && said.contains("failed 5") {
+        return Some("getpwnam failed 5 (input/output error)");
+    }
+    [("WSL_E_USER_NOT_FOUND", "WSL_E_USER_NOT_FOUND"), ("Read-only file system", "read-only file system"), ("Input/output error", "input/output error")]
+        .iter()
+        .find(|(sign, _)| said.contains(sign))
+        .map(|(_, why)| *why)
+}
+
+/// The least time between two automatic rebuilds: a disk that fails again
+/// at once has a cause a rebuild does not cure.
+pub const REBUILD_EVERY: u64 = 60 * 60;
+
+/// Whether kiri-win rebuilds the failed distro on its own (`autoRebuild`,
+/// for unattended machines whose engine data is disposable). Only Kiri
+/// Linux, never a distro of the person's own; only with the drive's room
+/// known and above the floor, since a rebuild on a full drive fails the
+/// same way; at most once in [`REBUILD_EVERY`].
+pub fn may_rebuild(on: bool, kiri_linux: bool, free: Option<u64>, last: Option<u64>, now: u64) -> bool {
+    on && kiri_linux && free.is_some_and(|f| f >= LOW_FREE) && last.is_none_or(|at| now.saturating_sub(at) >= REBUILD_EVERY)
+}
+
+/// The line the boot log gets once a rebuild worked, for scripts to match.
+pub fn rebuilt_line(why: &str) -> String {
+    format!("engine: Linux disk rebuilt after failure: {why}")
 }
 
 /// The error shown when the engine did not start. `drive` is the drive
@@ -43,7 +71,7 @@ pub fn not_started(said: &str, distro: &str, drive: Option<(&str, u64)>) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{failed, low_notice, not_started, LOW_FREE};
+    use super::{failed, low_notice, may_rebuild, not_started, reason, rebuilt_line, LOW_FREE, REBUILD_EVERY};
 
     #[test]
     fn each_disk_failure_is_seen() {
@@ -81,5 +109,25 @@ mod tests {
             assert!(m.starts_with("Kiri's Linux disk failed"), "{m}");
             assert!(m.contains("e2fsck") && m.contains("wsl --unregister kiri"), "{m}");
         }
+    }
+
+    #[test]
+    fn the_reason_names_the_first_sign() {
+        assert_eq!(reason("CreateProcessParseCommon:1061: getpwnam(root) failed 5\r\nError code: Wsl/WSL_E_USER_NOT_FOUND"), Some("getpwnam failed 5 (input/output error)"));
+        assert_eq!(reason("touch: /x: Read-only file system"), Some("read-only file system"));
+        assert_eq!(reason("all fine"), None);
+        assert_eq!(rebuilt_line("read-only file system"), "engine: Linux disk rebuilt after failure: read-only file system");
+    }
+
+    #[test]
+    fn a_rebuild_needs_the_setting_kiri_linux_room_and_time() {
+        let now = 10 * REBUILD_EVERY;
+        assert!(may_rebuild(true, true, Some(LOW_FREE), None, now));
+        assert!(may_rebuild(true, true, Some(LOW_FREE), Some(now - REBUILD_EVERY), now));
+        assert!(!may_rebuild(false, true, Some(LOW_FREE), None, now), "off by default");
+        assert!(!may_rebuild(true, false, Some(LOW_FREE), None, now), "never a distro of the person's own");
+        assert!(!may_rebuild(true, true, Some(LOW_FREE - 1), None, now), "a full drive fails a rebuild too");
+        assert!(!may_rebuild(true, true, None, None, now), "room unknown");
+        assert!(!may_rebuild(true, true, Some(LOW_FREE), Some(now - 60), now), "rebuilt a minute ago");
     }
 }
