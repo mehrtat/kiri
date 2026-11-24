@@ -368,11 +368,69 @@ fn start_daemon() -> io::Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     let name = distro.unwrap_or_else(|| crate::setup::KIRI_DISTRO.to_owned());
-    let drive = crate::win::distro_dir(&name).and_then(|p| crate::win::free_bytes(&p));
+    let place = crate::win::distro_dir(&name);
+    let drive = place.as_deref().and_then(crate::win::free_bytes);
     if !said.trim().is_empty() {
         crate::serve::log(&format!("engine: WSL said: {}", said.trim()));
     }
+    if let Some(why) = crate::wsldisk::reason(&said) {
+        let free = drive.as_ref().map(|(_, f)| *f);
+        if crate::wsldisk::may_rebuild(auto_rebuild(), crate::setup::kiri_linux(), free, last_rebuild().map(|r| r.0), now_secs()) {
+            match rebuild(place.unwrap_or_else(crate::setup::kiri_linux_dir), why) {
+                Ok(()) => return Ok(()),
+                Err(e) => crate::serve::log(&format!("engine: could not rebuild Kiri's Linux disk: {e}")),
+            }
+        }
+    }
     Err(io::Error::other(crate::wsldisk::not_started(&said, &name, drive.as_ref().map(|(d, f)| (d.as_str(), *f)))))
+}
+
+/// Whether a failed Kiri Linux disk is rebuilt without asking: off unless
+/// `"autoRebuild": true` is in %LOCALAPPDATA%\Kiri\ui.json or
+/// KIRI_AUTO_REBUILD=1 is set, for unattended machines (build PCs) whose
+/// engine data is disposable. No administrator is needed for either.
+fn auto_rebuild() -> bool {
+    std::env::var("KIRI_AUTO_REBUILD").is_ok_and(|v| v == "1")
+        || prefs_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<Value>(&b).ok()).is_some_and(|p| p["autoRebuild"] == true)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Where the last automatic rebuild is kept: when (Unix seconds) and why.
+fn rebuilt_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Kiri").join("disk-rebuilt.json"))
+}
+
+fn last_rebuild() -> Option<(u64, String)> {
+    let v: Value = serde_json::from_slice(&std::fs::read(rebuilt_path()?).ok()?).ok()?;
+    Some((v["at"].as_u64()?, v["reason"].as_str().unwrap_or_default().to_owned()))
+}
+
+/// One rebuild at a time: the engine can be started from several threads.
+static REBUILDING: Mutex<()> = Mutex::new(());
+
+/// Kiri Linux made again from this build's own archive, unattended, and
+/// its engine started: everything in the old disk is lost.
+fn rebuild(base: std::path::PathBuf, why: &str) -> io::Result<()> {
+    let Ok(_one) = REBUILDING.try_lock() else { return Err(io::Error::other("a rebuild is already running")) };
+    crate::serve::log(&format!("engine: Kiri's Linux disk failed ({why}); autoRebuild is on, so it is made again in {}", base.display()));
+    crate::setup::reimport_kiri_linux(&base)?;
+    if let Some(path) = rebuilt_path() {
+        let _ = std::fs::write(path, json!({"at": now_secs(), "reason": why}).to_string());
+    }
+    let mut cmd = crate::win::tool("wsl.exe");
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    let _ = crate::update::output_within(cmd.args(["-d", crate::setup::KIRI_DISTRO, "-u", "root", "--", "/usr/local/bin/kiri-start"]), crate::update::WSL_LIMIT);
+    for _ in 0..100 {
+        if client::alive() {
+            crate::serve::log(&crate::wsldisk::rebuilt_line(why));
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(io::Error::other("Kiri Linux was made again, but its engine did not start"))
 }
 
 /// Every 30 s: the room on the drive that holds the distro's disk, to the
@@ -383,7 +441,12 @@ fn watch_host_disk() {
     loop {
         let name = distro().unwrap_or_else(|| crate::setup::KIRI_DISTRO.to_owned());
         if let Some((drive, free)) = crate::win::distro_dir(&name).and_then(|p| crate::win::free_bytes(&p)) {
-            let _ = client::request_within("PUT", "/kiri/hostdisk", Some(&json!({"drive": drive, "free": free})), true, Some(Duration::from_secs(5)));
+            let mut report = json!({"drive": drive, "free": free});
+            if let Some((at, why)) = last_rebuild() {
+                report["rebuiltAt"] = at.into();
+                report["rebuiltReason"] = why.into();
+            }
+            let _ = client::request_within("PUT", "/kiri/hostdisk", Some(&report), true, Some(Duration::from_secs(5)));
             let low = free < crate::wsldisk::LOW_FREE;
             if low && !warned {
                 let text = crate::wsldisk::low_notice(&drive, free);
