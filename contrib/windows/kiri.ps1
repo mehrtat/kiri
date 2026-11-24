@@ -193,6 +193,17 @@ if ($Uninstall) {
     if ($base) {
       Write-Host "The WSL distro '$Distro' is Kiri's (its disk is $base\ext4.vhdx): it is unregistered, and the images, containers and volumes on that disk are deleted with it."
       Step "WSL distro '$Distro' unregistered" { wsl.exe --unregister $Distro 2>$null | Out-Null; if ($LASTEXITCODE -ne 0) { throw "wsl --unregister exited $LASTEXITCODE" } }
+      # Setup may put Kiri Linux on another drive (<X>:\Kiri\wsl\kiri, the
+      # one with the most room): its folders, now empty, go too; a folder
+      # that still holds anything stays.
+      if (-not $kiriOwned) {
+        $d = $base
+        foreach ($i in 1..3) {
+          if (-not (Test-Path -LiteralPath $d) -or (Get-ChildItem -LiteralPath $d -Force | Select-Object -First 1)) { break }
+          Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue
+          $d = Split-Path $d -Parent
+        }
+      }
     } else {
       Write-Host "The WSL distro '$Distro' is not registered (already gone)."
     }
