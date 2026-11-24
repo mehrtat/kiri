@@ -139,6 +139,29 @@ fn save(s: &Saved) {
     let _ = std::fs::write(dir().join("setup.json"), serde_json::to_vec_pretty(s).unwrap_or_default());
 }
 
+/// Whether setup put the engine in Kiri Linux (its own distro, `kiri`),
+/// not an Ubuntu of the person's own.
+pub(crate) fn kiri_linux() -> bool {
+    let s = saved();
+    s.linux.as_deref() == Some("kiri") && s.distro.as_deref() == Some(KIRI_DISTRO)
+}
+
+/// Kiri Linux made again from this build's kiri-linux.tar.gz, in `base`
+/// (where it was): for a distro whose disk failed (wsldisk.rs). Everything
+/// in it is lost: images, containers, volumes, build cache.
+pub(crate) fn reimport_kiri_linux(base: &Path) -> io::Result<()> {
+    let tar = verified("kiri-linux.tar.gz")?;
+    let _ = quiet("wsl.exe").args(["--terminate", KIRI_DISTRO]).output();
+    wsl_ok(quiet("wsl.exe").args(["--unregister", KIRI_DISTRO]))?;
+    std::fs::create_dir_all(base)?;
+    wsl_ok(quiet("wsl.exe").args(["--import", KIRI_DISTRO]).arg(base).arg(&tar).args(["--version", "2"]))
+}
+
+/// The folder Kiri Linux is imported into when WSL does not say where it was.
+pub(crate) fn kiri_linux_dir() -> PathBuf {
+    dir().join("wsl").join(KIRI_DISTRO)
+}
+
 /// The distro setup put Kiri in, for the bridge.
 pub fn distro() -> Option<String> {
     saved().distro
