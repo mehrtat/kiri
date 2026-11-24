@@ -27,6 +27,28 @@ pub fn set(drive: &str, free: u64) {
     *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(Report { at: Instant::now(), drive: drive.to_owned(), free });
 }
 
+/// kiri-win's last automatic rebuild of this engine's disk (its `autoRebuild`
+/// setting): when, in Unix seconds, and why.
+static REBUILT: Mutex<Option<(u64, String)>> = Mutex::new(None);
+
+pub fn set_rebuilt(at: u64, why: &str) {
+    *REBUILT.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, why.to_owned()));
+}
+
+/// For `docker info`: the drive, its free bytes (from a fresh report), and
+/// the last rebuild, each null when unknown.
+pub fn info() -> serde_json::Value {
+    let last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = last.as_ref().filter(|r| r.at.elapsed() < FRESH);
+    let rebuilt = REBUILT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    serde_json::json!({
+        "KiriHostDrive": fresh.map(|r| r.drive.clone()),
+        "KiriHostDriveFree": fresh.map(|r| r.free),
+        "KiriDiskRebuiltAt": rebuilt.as_ref().map(|(at, _)| super::time::rfc3339(std::time::UNIX_EPOCH + Duration::from_secs(*at))),
+        "KiriDiskRebuildReason": rebuilt.map(|(_, why)| why),
+    })
+}
+
 /// Whether a request writes to the engine's disk as new work.
 fn new_work(method: &str, path: &str) -> bool {
     method == "POST"
@@ -76,6 +98,14 @@ mod tests {
         let m = refusal_of(&r, now).expect("refused");
         assert!(m.starts_with("host drive C: is full: 1200 MB free"), "{m}");
         assert!(refusal_of(&Report { free: FLOOR, ..r }, now).is_none());
+    }
+
+    #[test]
+    fn info_shows_the_last_rebuild() {
+        super::set_rebuilt(0, "read-only file system");
+        let v = super::info();
+        assert_eq!(v["KiriDiskRebuiltAt"], "1970-01-01T00:00:00.000000000Z");
+        assert_eq!(v["KiriDiskRebuildReason"], "read-only file system");
     }
 
     #[test]

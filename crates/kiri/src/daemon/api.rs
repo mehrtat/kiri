@@ -429,7 +429,7 @@ fn info(engine: &Engine) -> Value {
     let running = states.iter().filter(|s| **s == Status::Running).count();
     let images = engine.store.images().map(|v| v.len()).unwrap_or(0);
     let (mem_total, _) = engine.guest_memory().unwrap_or((0, 0));
-    json!({
+    let mut v = json!({
         "ID": "kiri",
         "Name": "kiri",
         "Containers": states.len(),
@@ -467,7 +467,11 @@ fn info(engine: &Engine) -> Value {
         "KiriOomKills": engine.memory_trouble().1,
         "KiriCpuPercent": engine.cpu_percent(),
         "Warnings": engine.records_damage(),
-    })
+    });
+    if let (Some(v), Some(host)) = (v.as_object_mut(), super::hostdisk::info().as_object()) {
+        v.extend(host.clone());
+    }
+    v
 }
 
 pub(super) fn filters(req: &Request, known: &[&str]) -> Result<Filters, Error> {
@@ -810,6 +814,9 @@ fn set_host_disk(req: &Request) -> Result<Value, Error> {
     let drive = body["drive"].as_str().filter(|d| !d.is_empty() && d.len() <= 64).ok_or_else(|| Error::BadRequest("drive must be the drive's name".into()))?;
     let free = body["free"].as_u64().ok_or_else(|| Error::BadRequest("free must be its free bytes".into()))?;
     super::hostdisk::set(drive, free);
+    if let Some(at) = body["rebuiltAt"].as_u64() {
+        super::hostdisk::set_rebuilt(at, body["rebuiltReason"].as_str().unwrap_or_default());
+    }
     Ok(Value::Null)
 }
 
