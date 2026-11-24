@@ -20,6 +20,9 @@ mod handover;
 // tested on any host.
 #[cfg(any(windows, test))]
 mod page;
+// Kiri's Linux disk failing under the engine: plain code.
+#[cfg(any(windows, test))]
+mod wsldisk;
 // The window's page, put together as on the Mac and Linux.
 #[cfg(windows)]
 #[path = "../../kiri/src/ui/assemble.rs"]

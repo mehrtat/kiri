@@ -247,3 +247,59 @@ mod tests {
         assert!(super::mismatch("arm64", "x64").unwrap().ends_with("-x86_64.msi instead."));
     }
 }
+
+/// The folder WSL keeps `distro`'s disk (ext4.vhdx) in: the BasePath of its
+/// key under HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss, read
+/// rather than guessed (an imported distro lives wherever it was imported).
+pub fn distro_dir(distro: &str) -> Option<PathBuf> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_SZ};
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    // A REG_SZ value of `sub`, at most 1024 UTF-16 units.
+    let value = |key: isize, sub: &[u16], name: &str| -> Option<String> {
+        let name = wide(name);
+        let mut buf = [0u16; 1024];
+        let mut bytes = (buf.len() * 2) as u32;
+        // SAFETY: an open key, NUL-terminated names and a buffer of `bytes` bytes.
+        let r = unsafe { RegGetValueW(key, sub.as_ptr(), name.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr().cast(), &mut bytes) };
+        (r == ERROR_SUCCESS).then(|| String::from_utf16_lossy(&buf[..(bytes as usize / 2)]).trim_end_matches('\0').to_owned())
+    };
+    let path = wide(r"Software\Microsoft\Windows\CurrentVersion\Lxss");
+    let mut key = 0isize;
+    // SAFETY: opening a key by a NUL-terminated path into `key`.
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_READ, &mut key) } != ERROR_SUCCESS {
+        return None;
+    }
+    let mut found = None;
+    for i in 0.. {
+        let mut sub = [0u16; 256];
+        let mut len = sub.len() as u32;
+        // SAFETY: the open key and a buffer of `len` units for the subkey's name.
+        let r = unsafe { RegEnumKeyExW(key, i, sub.as_mut_ptr(), &mut len, std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+        if r != ERROR_SUCCESS {
+            break;
+        }
+        let sub = &sub[..=len as usize];
+        if value(key, sub, "DistributionName").is_some_and(|n| n.eq_ignore_ascii_case(distro)) {
+            found = value(key, sub, "BasePath").map(|p| PathBuf::from(p.strip_prefix(r"\\?\").unwrap_or(&p)));
+            break;
+        }
+    }
+    // SAFETY: the key opened above, closed once.
+    unsafe { RegCloseKey(key) };
+    found
+}
+
+/// The free bytes on the drive that holds `path`, and its root (`C:\`).
+pub fn free_bytes(path: &Path) -> Option<(String, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let at: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: a NUL-terminated path; the totals we do not need are null.
+    if unsafe { GetDiskFreeSpaceExW(at.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) } == 0 {
+        return None;
+    }
+    let root = path.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
+    Some((root, free))
+}

@@ -92,6 +92,17 @@ fn status_of(e: Error) -> (u16, String) {
 }
 
 fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+    // The host drive under the engine's disk is full (hostdisk.rs): no new
+    // work. A body still unread closes the connection.
+    if let Some(why) = super::hostdisk::refusal(&req.method, &req.path) {
+        crate::diag::warn!("refused: host drive full", method = req.method, path = req.path);
+        let e = Error::Io(io::Error::new(io::ErrorKind::StorageFull, why));
+        if streams_body(&req.method, &req.path) {
+            error_closing(w, e)?;
+            return Ok(Next::Close);
+        }
+        return reply(w, Err(e), 200);
+    }
     if let Some(done) = super::ops::route(req, engine, w) {
         return done;
     }
@@ -120,6 +131,8 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
+        // kiri-win: the room on the Windows drive that holds the distro's disk.
+        ("PUT", "/kiri/hostdisk") => return reply(w, set_host_disk(req), 204),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
         // Settings → Domains: the container-domain routers' ports.
         ("GET", "/kiri/domains") => return reply(w, Ok(super::domains::report()), 200),
@@ -790,6 +803,14 @@ fn set_host_proxy(req: &Request) -> Result<Value, Error> {
         super::proxy::set_relay(relay.iter().filter_map(|(k, v)| Some((k.parse().ok()?, u16::try_from(v.as_u64()?).ok()?))).collect());
     }
     Ok(super::proxy::report())
+}
+
+fn set_host_disk(req: &Request) -> Result<Value, Error> {
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let drive = body["drive"].as_str().filter(|d| !d.is_empty() && d.len() <= 64).ok_or_else(|| Error::BadRequest("drive must be the drive's name".into()))?;
+    let free = body["free"].as_u64().ok_or_else(|| Error::BadRequest("free must be its free bytes".into()))?;
+    super::hostdisk::set(drive, free);
+    Ok(Value::Null)
 }
 
 fn set_proxy(req: &Request) -> Result<Value, Error> {
