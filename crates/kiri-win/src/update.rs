@@ -610,17 +610,23 @@ pub(crate) const WSL_LIMIT: Duration = Duration::from_secs(60);
 const RESTART_LIMIT: Duration = Duration::from_secs(240);
 
 /// `cmd`'s output, as `Command::output`, but killed (Err TimedOut) when it
-/// runs past `limit`: a wsl.exe right after Windows wakes can hang.
+/// runs past `limit`: a wsl.exe right after Windows wakes can hang. Returns
+/// as soon as it exits (it waits on the process, it does not poll): this
+/// runs before the window opens, where `wsl.exe -l -q` takes about 40 ms.
 pub(crate) fn output_within(cmd: &mut Command, limit: Duration) -> io::Result<std::process::Output> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let until = Instant::now() + limit;
-    while child.try_wait()?.is_none() {
-        if Instant::now() >= until {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("WSL did not finish in {} s", limit.as_secs())));
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    let ms = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX - 1);
+    // SAFETY: waits on the child's own process handle, open while `child` lives.
+    let waited = unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(child.as_raw_handle() as _, ms) };
+    if waited == WAIT_TIMEOUT {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::new(io::ErrorKind::TimedOut, format!("WSL did not finish in {} s", limit.as_secs())));
+    }
+    if waited != WAIT_OBJECT_0 {
+        return Err(io::Error::last_os_error());
     }
     // It has exited: what it wrote (a line or two) is in the pipes.
     child.wait_with_output()
@@ -628,7 +634,7 @@ pub(crate) fn output_within(cmd: &mut Command, limit: Duration) -> io::Result<st
 
 /// The engine's own Kiri version, when it answers.
 fn engine_version() -> Option<String> {
-    crate::client::request("GET", "/version", None).ok().filter(|r| r.ok()).and_then(|r| crate::client::kiri_version(&r.json()).map(str::to_owned))
+    crate::client::get_background("/version").ok().and_then(|v| crate::client::kiri_version(&v).map(str::to_owned))
 }
 
 static CATCH_UP: crate::wslsync::CatchUp = crate::wslsync::CatchUp::new();

@@ -142,6 +142,13 @@ pub struct Ui {
     loaded: bool,
     /// The webview has been asked for.
     started: bool,
+    /// Counts the webviews asked for: one that arrives after the window
+    /// let go of it (closed while WebView2 was still making it) is dropped.
+    generation: u64,
+    /// The window let go of its webview (Settings → Closing the window →
+    /// Close): what the engine sends meanwhile is dropped, not queued, as
+    /// the page asks for everything again when it next loads.
+    released: bool,
     menu: Menu,
     /// Every message the page sends; called outside the borrow of UI.
     on_message: Rc<dyn Fn(String)>,
@@ -183,6 +190,42 @@ pub fn pick_file(title: &str, filters: &[(String, String)], done: impl FnOnce(Op
     if hwnd != 0 {
         // SAFETY: posting to our own window; a closed one just drops it.
         let _ = unsafe { PostMessageW(Some(HWND(hwnd as _)), WM_RUN, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// Settings → Storage → Change…: Windows' own folder picker (`FOS_PICKFOLDERS`)
+/// over the window, on its thread, outside `with_ui`. `done` gets the chosen
+/// folder, or None when cancelled, on a thread of its own.
+pub fn pick_folder(title: &str, done: impl FnOnce(Option<std::path::PathBuf>) + Send + 'static) {
+    let title = HSTRING::from(title);
+    BARE.lock().unwrap_or_else(PoisonError::into_inner).push(Box::new(move |hwnd| {
+        // SAFETY: on the window's thread, where COM is initialised (run).
+        let path = unsafe { folder_dialog(hwnd, &title) }.ok().flatten();
+        std::thread::spawn(move || done(path));
+    }));
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        // SAFETY: posting to our own window; a closed one just drops it.
+        let _ = unsafe { PostMessageW(Some(HWND(hwnd as _)), WM_RUN, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// IFileOpenDialog with `FOS_PICKFOLDERS`: one local folder on disk, or None when cancelled.
+unsafe fn folder_dialog(owner: HWND, title: &HSTRING) -> windows::core::Result<Option<std::path::PathBuf>> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    // SAFETY: COM calls on this thread's apartment.
+    unsafe {
+        let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        d.SetTitle(title)?;
+        d.SetOptions(d.GetOptions()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)?;
+        if d.Show(Some(owner)).is_err() {
+            return Ok(None);
+        }
+        let name = d.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        Ok(path.map(std::path::PathBuf::from))
     }
 }
 
@@ -262,8 +305,8 @@ unsafe fn foreground(hwnd: HWND) {
 /// Shows the window, making its webview the first time. The webview is
 /// made outside the borrow of UI: its callbacks borrow it too.
 fn show() {
-    if let Some(Some(hwnd)) = with_ui(Ui::show) {
-        if let Err(e) = start_webview(hwnd) {
+    if let Some(Some((hwnd, generation))) = with_ui(Ui::show) {
+        if let Err(e) = start_webview(hwnd, generation) {
             crate::serve::log(&format!("webview: {e}"));
         }
     }
@@ -278,12 +321,14 @@ impl Ui {
                 // SAFETY: a live webview, on its own thread.
                 let _ = unsafe { w.ExecuteScript(*js.as_ref().as_pcwstr(), &done) };
             }
+            _ if self.released => {}
             _ => self.pending.push(js),
         }
     }
 
-    /// Shows the window; the window to make a webview for, the first time.
-    fn show(&mut self) -> Option<HWND> {
+    /// Shows the window; the window to make a webview for (and which one
+    /// it is) when it has none.
+    fn show(&mut self) -> Option<(HWND, u64)> {
         // SAFETY: our window, on its thread.
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_RESTORE);
@@ -294,7 +339,12 @@ impl Ui {
             // whatever was behind it: once more, shortly.
             SetTimer(Some(self.hwnd), TIMER_FOREGROUND, 400, None);
         }
-        (!std::mem::replace(&mut self.started, true)).then_some(self.hwnd)
+        if std::mem::replace(&mut self.started, true) {
+            return None;
+        }
+        self.released = false;
+        self.generation += 1;
+        Some((self.hwnd, self.generation))
     }
 
     pub fn hide(&mut self) {
@@ -302,6 +352,35 @@ impl Ui {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
+    }
+
+    /// The window's close button: hidden, as it always was, or (Settings →
+    /// Closing the window → Close) hidden and its webview let go, which ends
+    /// WebView2's processes. The tray icon and the pipe stay; the window
+    /// makes a new webview when it opens again. Setup's page keeps its
+    /// progress in the page, so the window only hides during setup.
+    fn close(&mut self) {
+        self.hide();
+        if in_setup() || crate::engine::prefs()["closeButton"] != "close" {
+            return;
+        }
+        let controller = self.controller.take();
+        self.webview = None;
+        self.started = false;
+        self.released = true;
+        self.loaded = false;
+        self.pending.clear();
+        STRING_LOAD.set(false);
+        if let Some(c) = controller {
+            // SAFETY: our window's controller, on its thread. Its handlers
+            // find the window busy (with_ui gives None) and do nothing.
+            unsafe {
+                let _ = c.Close();
+            }
+        }
+        // What the page followed (terminals, a log, live figures) goes
+        // with it, as when Linux's window closes.
+        crate::engine::page_gone();
     }
 
     pub fn visible(&self) -> bool {
@@ -411,7 +490,7 @@ pub fn run(show: bool, setup: bool, on_message: impl Fn(String) + 'static, on_tr
             SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), Some(LPARAM(i.0 as isize)));
         }
     }
-    UI.with(|u| *u.borrow_mut() = Some(Ui { hwnd, webview: None, controller: None, pending: Vec::new(), loaded: false, started: false, menu: Menu::default(), on_message: Rc::new(on_message) }));
+    UI.with(|u| *u.borrow_mut() = Some(Ui { hwnd, webview: None, controller: None, pending: Vec::new(), loaded: false, started: false, generation: 0, released: false, menu: Menu::default(), on_message: Rc::new(on_message) }));
     tray(hwnd, small, NIM_ADD);
     if show {
         self::show();
@@ -541,7 +620,12 @@ fn tray_menu(hwnd: HWND) {
             ID_START => tray_cmd("start"),
             ID_STOP => tray_cmd("stop"),
             ID_UPDATE => tray_cmd("update"),
-            ID_QUIT => PostQuitMessage(0),
+            ID_QUIT => {
+                if crate::engine::prefs()["stopOnQuit"] == true {
+                    crate::engine::stop();
+                }
+                PostQuitMessage(0);
+            }
             n if n >= ID_CONTAINER => {
                 if let Some((id, _)) = menu.running.get(n - ID_CONTAINER) {
                     show();
@@ -567,7 +651,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
         }
         WM_SIZE => with_ui_soon(|ui| ui.resize()),
-        WM_CLOSE => with_ui_soon(Ui::hide),
+        WM_CLOSE => with_ui_soon(Ui::close),
         WM_TRAY => match (lparam.0 & 0xffff) as u32 {
             WM_LBUTTONUP => {
                 if with_ui(|ui| ui.visible()) == Some(true) {
@@ -598,7 +682,7 @@ fn data_dir() -> HSTRING {
     HSTRING::from(dir.as_os_str())
 }
 
-fn start_webview(hwnd: HWND) -> windows::core::Result<()> {
+fn start_webview(hwnd: HWND, generation: u64) -> windows::core::Result<()> {
     let env_done = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(move |result, env: Option<ICoreWebView2Environment>| {
         result?;
         let Some(env) = env else { return Ok(()) };
@@ -606,7 +690,7 @@ fn start_webview(hwnd: HWND) -> windows::core::Result<()> {
         let ctl_done = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |result, ctl: Option<ICoreWebView2Controller>| {
             result?;
             if let Some(ctl) = ctl
-                && let Err(e) = webview_ready(hwnd, &env_for_page, ctl)
+                && let Err(e) = webview_ready(hwnd, generation, &env_for_page, ctl)
             {
                 crate::serve::log(&format!("webview: {e}"));
             }
@@ -619,7 +703,13 @@ fn start_webview(hwnd: HWND) -> windows::core::Result<()> {
     unsafe { CreateCoreWebView2EnvironmentWithOptions(PCWSTR::null(), &data_dir(), None, &env_done) }
 }
 
-fn webview_ready(hwnd: HWND, env: &ICoreWebView2Environment, ctl: ICoreWebView2Controller) -> windows::core::Result<()> {
+fn webview_ready(hwnd: HWND, generation: u64, env: &ICoreWebView2Environment, ctl: ICoreWebView2Controller) -> windows::core::Result<()> {
+    // Closed while WebView2 was making it: not wanted any more. A busy
+    // window (None) is one still showing, so it keeps the webview.
+    if with_ui(|ui| ui.started && ui.generation == generation) == Some(false) {
+        // SAFETY: the new controller, on the window's thread.
+        return unsafe { ctl.Close() };
+    }
     // SAFETY: the new controller and its webview, on the window's thread.
     unsafe {
         let mut r = RECT::default();

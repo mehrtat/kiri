@@ -28,12 +28,18 @@
 }
 :root[dir=rtl] { --start: right; --end: left; --fwd: 270deg; --dir: -1; }
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme="dark"]) {
     --bg: #F5F7FA; --side: #EDF0F5; --panel: #FFFFFF; --raised: #F3F5F9; --line: #DDE3EB;
     --text: #0F1419; --muted: #5E6773; --faint: #8A929C; --row-hover: rgba(15, 20, 25, .035);
     --sun-text: #8A6100; --red-text: #B42318; --ext-text: #6941C6;
     color-scheme: light;
   }
+}
+:root[data-theme="light"] {
+  --bg: #F5F7FA; --side: #EDF0F5; --panel: #FFFFFF; --raised: #F3F5F9; --line: #DDE3EB;
+  --text: #0F1419; --muted: #5E6773; --faint: #8A929C; --row-hover: rgba(15, 20, 25, .035);
+  --sun-text: #8A6100; --red-text: #B42318; --ext-text: #6941C6;
+  color-scheme: light;
 }
 /* Type: four sizes, and nothing else (tests/ui/type.js checks). Small print,
    the base everything you read is set in, section headings, page titles.
@@ -464,7 +470,8 @@ td.r, th.r { text-align: var(--end); }
    running, a grey outline stopped, red failed; a state with none is left out.
    An image nothing uses steps back. */
 :root { --lit-hi: #A8F5D4; }
-@media (prefers-color-scheme: light) { :root { --lit-hi: #0F9E6A; } }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --lit-hi: #0F9E6A; } }
+:root[data-theme="light"] { --lit-hi: #0F9E6A; }
 td.used .l1 { display: flex; align-items: center; gap: 6px; min-height: 17px; }
 td.used .off { color: var(--faint); }
 td.used .l2 { display: flex; align-items: center; gap: 6px; margin-top: 3px; color: var(--muted); font-size: var(--fs); font-variant-numeric: tabular-nums; }
@@ -578,7 +585,8 @@ tr.group b.gopen:hover, tr.group b.gopen:focus-visible { text-decoration: underl
 /* A row's name opens it, a link; so does the rest of a row that has a page. */
 .link { color: var(--blue-light); cursor: pointer; }
 .link:hover { text-decoration: underline; text-underline-offset: 3px; }
-@media (prefers-color-scheme: light) { .link { color: var(--blue); } }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .link { color: var(--blue); } }
+:root[data-theme="light"] .link { color: var(--blue); }
 /* A container's page. */
 .dhead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 4px 0 14px; }
 .dhead .tile { width: 40px; height: 40px; border-radius: 10px; }
@@ -899,8 +907,8 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .ctx-prog i { display: block; height: 100%; background: var(--blue); transition: width .4s; }
 #ctxcard .row-end { display: flex; justify-content: space-between; gap: 8px; }
 #ctxcard .x { position: absolute; top: 10px; inset-inline-end: 10px; border: 0; background: none; color: var(--faint); cursor: pointer; }
-/* The update card: bottom right, above the status bar. */
-.updcard { position: fixed; inset-inline-end: 16px; bottom: 36px; width: 352px; box-sizing: border-box; padding: 16px; display: grid; gap: 14px; z-index: 6;
+/* The update card: bottom right, above the status bar; in a narrow window no wider than the window, its buttons wrap. */
+.updcard { position: fixed; inset-inline-end: 16px; bottom: 36px; width: min(352px, calc(100vw - 32px)); box-sizing: border-box; padding: 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; z-index: 6;
            background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 14px 36px rgba(0, 0, 0, .45); }
 .updcard .head { display: flex; gap: 12px; align-items: flex-start; }
 .updcard .ic { flex: none; width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; color: var(--blue-light); background: color-mix(in srgb, var(--blue) 18%, transparent); }
@@ -913,7 +921,7 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .updcard .err { margin-top: 6px; font-size: var(--fs); color: var(--red); }
 .updcard .close { flex: none; border: 0; background: none; padding: 2px; color: var(--faint); cursor: pointer; display: inline-flex; }
 .updcard .close:hover { color: var(--text); }
-.updcard .row { display: flex; align-items: center; gap: 8px; }
+.updcard .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .updcard .btn { height: 32px; }
 .updcard .skip { margin-inline-start: auto; border: 0; background: none; padding: 0; font: inherit; font-size: var(--fs); color: var(--muted); cursor: pointer; white-space: nowrap; }
 .updcard .skip:hover { color: var(--text); }
@@ -1157,6 +1165,31 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .rports input:disabled { color: var(--faint); }
 .rports .btn { height: 32px; }
 .pref + .rp-notes { margin-top: -6px; }
+.pref .sockhint { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-top: 4px; color: var(--text); }
+.pref .sockhint code { padding: 1px 6px; border-radius: 5px; background: var(--panel); border: 1px solid var(--line); font: var(--fs-mono) var(--mono-font); user-select: text; -webkit-user-select: text; }
+/* Settings → Storage */
+.st-t { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.st-badge { font-size: var(--fs-small); font-weight: 500; padding: 1px 7px; border-radius: 99px; background: color-mix(in srgb, var(--blue) 16%, transparent); color: var(--text); }
+.st-path { overflow-wrap: anywhere; word-break: break-word; color: var(--text); }
+.st-meta { display: block; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.pref .st-acts { grid-row: 1 / span 2; grid-column: 2; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.st-box { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--panel); display: grid; gap: 8px; min-width: 0; }
+.st-box.warn { border-color: color-mix(in srgb, var(--sun) 45%, var(--line)); background: color-mix(in srgb, var(--sun) 8%, var(--panel)); }
+.st-box.err { border-color: color-mix(in srgb, var(--red) 45%, var(--line)); background: color-mix(in srgb, var(--red) 8%, var(--panel)); }
+.st-box .st-hd { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.st-box.warn .st-hd svg { color: var(--sun-text); flex: none; }
+.st-box.err .st-hd svg { color: var(--red-text); flex: none; }
+.st-box p { color: var(--muted); font-size: var(--fs); overflow-wrap: anywhere; }
+.st-box .st-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.st-bar { width: 100%; height: 6px; border-radius: 9px; background: var(--raised); overflow: hidden; }
+.st-bar span { display: block; height: 100%; background: var(--blue); }
+.st-opts { display: grid; gap: 8px; margin-top: 4px; }
+.st-opt { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; align-items: start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); cursor: pointer; }
+.st-opt:has(input:checked) { border-color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, var(--bg)); }
+.st-opt input { margin-top: 3px; accent-color: var(--blue); }
+.st-opt b { font-weight: 600; color: var(--text); }
+.st-opt small { grid-column: 2; color: var(--muted); font-size: var(--fs-small); }
+@media (max-width: 520px) { .pref.st-pref { grid-template-columns: minmax(0, 1fr); } .pref.st-pref .st-acts { grid-row: auto; grid-column: 1; justify-content: flex-start; margin-top: 8px; } }
 /* Chinese and Japanese break between any two characters: a short choice (关闭, 开启)
    stays on one line, as an English word does; Korean's too. Only in a CJK window,
    so English lays out as it did. */
@@ -1235,7 +1268,8 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 /* The build question: each answer in a line of its own, its name in the text colour. */
 .dialog.alert > p.bw-opt b { color: var(--text); font-weight: 600; }
 .dialog.alert > p.bw-later { font-size: var(--fs-small); }
-@media (prefers-color-scheme: light) { .dialog.alert > .ico.info { --ink: var(--blue); } }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .dialog.alert > .ico.info { --ink: var(--blue); } }
+:root[data-theme="light"] .dialog.alert > .ico.info { --ink: var(--blue); }
 /* Removing: a red tint, not a block of red. */
 .port-row { display: grid; grid-template-columns: 1fr 18px 1fr 74px 30px; gap: 8px; align-items: center; }
 .port-row input, .port-row select { height: 30px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); font: var(--fs) ui-monospace, "SF Mono", Menlo, monospace; min-width: 0; }
@@ -2243,6 +2277,8 @@ body.beat { --beat: ring 1.6s ease-out; }
 .dg-log { background: #0A0E12; border: 1px solid var(--line); border-radius: 10px; height: 280px; overflow: auto; padding: 6px 0; font: var(--fs-log)/1.5 var(--mono-font);
           color: #D9DEE4; user-select: text; -webkit-user-select: text; cursor: text; }
 .dg-row { display: grid; grid-template-columns: 84px 38px 46px minmax(0, 1fr); gap: 8px; padding: 0 12px; }
+/* A narrow window: time, level and part on top, the message on a full-width line under them. */
+@media (max-width: 900px) { .dg-row { grid-template-columns: 84px 38px minmax(0, 1fr); row-gap: 0; padding-block: 2px; } .dg-row .m { grid-column: 1 / -1; } }
 .dg-row:hover { background: rgba(255, 255, 255, .04); }
 .dg-row .t { color: #6B7682; font-variant-numeric: tabular-nums; }
 .dg-row .lv { font-weight: 600; font-size: var(--fs-small); letter-spacing: .02em; }
@@ -2307,13 +2343,15 @@ body.beat { --beat: ring 1.6s ease-out; }
 .rp-dialog .err { font-size: var(--fs); color: var(--red-text); }
 /* --- The built-in terminal: a panel under the page (tests/ui/terminal.js) ----------- */
 :root { --term-bg: #0B0F13; --term-fg: #D7DCE1; }
-@media (prefers-color-scheme: light) { :root { --term-bg: #FFFFFF; --term-fg: #1F2328; } }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --term-bg: #FFFFFF; --term-fg: #1F2328; } }
+:root[data-theme="light"] { --term-bg: #FFFFFF; --term-fg: #1F2328; }
 main { position: relative; }
 /* Raised above the page: a shadow up onto it, a lighter top edge and a lifted
    header, so the panel never reads as more of the page. */
 .htdrawer { flex: none; height: var(--ht-h, 300px); border-top: 1px solid color-mix(in srgb, var(--text) 16%, var(--line)); position: relative; z-index: 3; display: flex; flex-direction: column; min-height: 0; background: var(--panel);
   box-shadow: 0 -10px 28px rgb(0 0 0 / .32), 0 -1px 0 rgb(0 0 0 / .25); }
-@media (prefers-color-scheme: light) { .htdrawer { box-shadow: 0 -8px 22px rgb(0 0 0 / .10); } }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .htdrawer { box-shadow: 0 -8px 22px rgb(0 0 0 / .10); } }
+:root[data-theme="light"] .htdrawer { box-shadow: 0 -8px 22px rgb(0 0 0 / .10); }
 .htdrawer[hidden] { display: none; }
 .htdrawer.max { position: absolute; inset: 0; height: auto; border-top: 0; z-index: 10; }
 .htgrip { position: absolute; top: -3px; inset-inline-start: 0; inset-inline-end: 0; height: 6px; cursor: row-resize; z-index: 5; }
@@ -2765,7 +2803,7 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0,
+const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, storage: null, stErr: "", proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -2943,7 +2981,7 @@ const prefs = { font: "System", mono: "System Mono", scale: 1, tab: "appearance"
 const ACCENTS = [["blue", "Blue", "#0D6EFD"], ["purple", "Purple", "#8C6EF5"], ["orange", "Orange", "#F58228"], ["teal", "Teal", "#14B4A5"], ["pink", "Pink", "#EC408C"], ["green", "Green", "#28AA5A"]];
 /* i18n */ void [tr("Blue"), tr("Purple"), tr("Orange"), tr("Teal"), tr("Pink"), tr("Green")];
 const darkNow = () => prefs.theme === "dark" || (prefs.theme !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { themeBtn(); if (ui.view === "settings") render(); });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { applyPrefs(); themeBtn(); if (ui.view === "settings") render(); });
 // The strip's theme button shows what a click switches to.
 function themeBtn() {
   const b = $("theme-toggle"), dark = darkNow();
@@ -2960,6 +2998,7 @@ const LOG_SIZES = [[11, "Small"], [13, "Medium"], [15, "Large"]];
 /* i18n */ void [tr("Small"), tr("Medium"), tr("Large")];
 const quote = (f) => `"${String(f).replace(/["\\]/g, "")}"`;
 function applyPrefs() {
+  document.documentElement.dataset.theme = darkNow() ? "dark" : "light";
   const r = document.documentElement.style;
   const base = prefs.font === "System" ? '-apple-system, BlinkMacSystemFont, "SF Pro Text"' : `${quote(prefs.font)}, -apple-system`;
   r.setProperty("--ui-base", base);
@@ -3564,14 +3603,15 @@ function runCommand(cmd) {
   const d = ui.detail, out = $("term-out");
   d.term.history.push(cmd);
   d.term.at = d.term.history.length;
-  const block = document.createElement("div");
-  block.dataset.pending = "1";
+  const block = document.createElement("div"), path = wrapped(d.term, cmd);
+  // The reply names the command it ran, so it finds its own block even when a later one finished first.
+  block.dataset.pending = path;
   block.innerHTML = `<div class="cmd"><span class="ps1"></span><span class="typed"></span></div><div class="body quiet">${tr("running…")}</div>`;
   block.querySelector(".ps1").textContent = ps1(d.term, d.info);
   block.querySelector(".typed").textContent = cmd;
   out.append(block);
   termEl.scrollTop = termEl.scrollHeight;
-  send("exec", { id: d.id, path: wrapped(d.term, cmd) });
+  send("exec", { id: d.id, path });
 }
 
 function finishExec(e) {
@@ -3585,7 +3625,7 @@ function finishExec(e) {
     setPrompt();
   }
   const out = $("term-out") ?? termEl.querySelector("#term-out");
-  const block = out.querySelector("[data-pending]");
+  const block = [...out.querySelectorAll("[data-pending]")].find((b) => b.dataset.pending === e.cmd);
   // The opening probe has no block of its own.
   if (!block || e.cmd === ui.detail.term.probed) return;
   block.removeAttribute("data-pending");
@@ -3638,7 +3678,7 @@ function renderDetail() {
   const facts = [[tr("Image"), `<span title="${esc(c.Image)}">${esc(refLabel(c.Image))}</span>`],
     id && [tr("ID"), `<span class="mono" title="${esc(id)}">sha256:${esc(id.slice(7, 19))}</span>${copyBtn(id, tr("image ID"))}`],
     project && ["Compose", `<span class="cproj"><svg viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.stack}"/></svg>${esc(project)}</span>`]].filter(Boolean);
-  $("content").innerHTML = `<div class="dhead">
+  const heading = `<div class="dhead">
       <div class="tile-wrap">${tile(c.icon, "cube")}${reachable ? `<span class="kbadge" title="${tr("Reachable at {url}", { url: esc(domain) })}">${KDOT}</span>` : ""}</div>
       <div class="who"><b>${esc(d.name)}</b></div>
       ${statusPill(c)}
@@ -3656,16 +3696,29 @@ function renderDetail() {
     </span></div>
     ${c.State === "exited" && c.KiriOOMKilled ? oomLine(tr("Stopped: out of memory"), c.KiriFinishedAt ? tr("{time} ago, when the VM's {mem} ran out.", { time: since(c.KiriFinishedAt), mem: memText(ui.mem?.ceiling || 0) }) : tr("when the VM's {mem} ran out.", { mem: memText(ui.mem?.ceiling || 0) }),
       btn(tr("Start again"), `data-c="start" data-id="${c.Id}"`) + btn(tr("More memory"), "data-memmore")) : ""}
-    ${fixPanel(c)}
-    <div id="dbody"></div>`;
-  const body = $("dbody");
+    ${fixPanel(c)}`;
+  const content = $("content");
+  let body = $("dbody");
+  const keepTerminal = d.tab === "terminal" && running && body?.parentNode === content && termEl.parentNode === body;
+  // The same container's Logs tab, already drawn: its bar stays, so Find in logs keeps its focus and caret.
+  const keepLogs = d.tab === "logs" && body?.parentNode === content && body.dataset.logs === c.Id && logEl.parentNode === body;
+  if (keepTerminal || keepLogs) {
+    // Replacing the detail body disconnects the prompt and drops its focus.
+    while (content.firstChild !== body) content.firstChild.remove();
+    body.insertAdjacentHTML("beforebegin", heading);
+  } else {
+    content.innerHTML = `${heading}<div id="dbody"></div>`;
+    body = $("dbody");
+  }
   watchStats();
   if (d.focusFix && $("fix-val")) { d.focusFix = false; $("fix-val").focus(); }
   if (d.tab === "overview") {
     body.innerHTML = overview(c, d.info);
     if (running) { body.prepend(statsEl); if (!statsEl.childElementCount) drawStats(); }
   }
+  else if (d.tab === "logs" && keepLogs) logCount();
   else if (d.tab === "logs") {
+    body.dataset.logs = c.Id;
     const levels = [["", tr("All levels")], ["error", tr("Error")], ["warn", tr("Warn")], ["info", tr("Info")], ["debug", tr("Debug")]];
     body.innerHTML = `<div class="logbar"><input class="field" id="log-filter" placeholder="${tr("Find in logs")}" spellcheck="false" value="${esc(d.logFilter)}">
       <select id="log-level" aria-label="${tr("Level")}">${levels.map(([v, l]) => `<option value="${v}"${d.logLevel === v ? " selected" : ""}>${l}</option>`).join("")}</select>
@@ -3679,10 +3732,15 @@ function renderDetail() {
     $("log-follow").addEventListener("change", (ev) => { d.follow = ev.target.checked; if (d.follow) logEl.scrollTop = logEl.scrollHeight; });
     if (d.follow) logEl.scrollTop = logEl.scrollHeight;
   } else if (d.tab === "terminal") {
-    body.innerHTML = running
+    const toolbar = running
       ? `<div class="logbar"><span class="muted">${tr("Runs each command with {sh} in {name}; {cd} carries over. ↑ and ↓ go through earlier commands.", { sh: '<span class="mono">sh -c</span>', name: esc(d.name), cd: '<span class="mono">cd</span>' })}</span><span style="flex:1"></span>${btn(tr("Open in Terminal"), "data-terminal", "primary")}</div>`
       : `<div class="logbar"><span class="muted">${tr("Start the container to run commands in it.")}</span></div>`;
-    if (running) { body.append(termEl); setPrompt(); probePrompt(); }
+    if (keepTerminal) body.firstElementChild.outerHTML = toolbar;
+    else {
+      body.innerHTML = toolbar;
+      if (running) body.append(termEl);
+    }
+    if (running) { setPrompt(); probePrompt(); }
   } else body.innerHTML = filesView(d);
 }
 
@@ -4031,6 +4089,7 @@ const CTX_NAMES = { orbstack: "OrbStack", "desktop-linux": "Docker Desktop", def
 const CTX_SNOOZE = 7 * 864e5;
 const ctx = { card: null };
 const ctxOther = () => !!ui.status && ui.status.context !== ui.status.ours;
+const ctxPinned = () => ui.status?.pinned || "";
 const ctxLabel = (c) => (CTX_NAMES[c] ? tr(CTX_NAMES[c]) : c);
 const ctxWarn = (cls = "") => `<svg class="${cls}" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg>`;
 // "1.2GB", "187MB", "5.6kB" (docker's image sizes) in bytes.
@@ -4039,16 +4098,25 @@ const ctxBytes = (v) => { const m = /^([\d.]+)\s*([kMGT]?)B$/i.exec(String(v || 
 function ctxStatusItem() {
   if (!ui.status) return "";
   if (!ctxOther()) return `<span class="sep">·</span><span class="item ctx-ok" title="${tr("The docker command uses {app}", { app: esc(ui.status.app || "Kiri") })}"><i></i>docker → ${esc(ui.status.app || "Kiri")}</span>`;
+  const pinned = ctxPinned();
+  if (pinned) return `<span class="sep">·</span><button class="item ctx-warn" data-ctxswitch title="${tr("{env} is set, so docker uses another engine instead of {app}", { env: esc(pinned), app: esc(ui.status.app || "Kiri") })}">${ctxWarn()}docker → ${esc(pinned)}</button>`;
   return `<span class="sep">·</span><button class="item ctx-warn" data-ctxswitch title="${tr("The docker command uses {engine}. Switch it to {app}", { engine: esc(ctxLabel(ui.status.context)), app: esc(ui.status.app || "Kiri") })}">${ctxWarn()}docker → ${esc(rtl() ? island(ctxLabel(ui.status.context)) : ctxLabel(ui.status.context))}</button>`;
 }
 
 function renderCtxStrip() {
   const el = $("impstrip");
   if (!ctxOther() || !["containers", "images"].includes(ui.view) || Date.now() < (prefs.ctxSnooze || 0) || ctx.card) return false;
-  el.innerHTML = `${ctxWarn("is-warn")}
-    <span class="is-text">${tr("<b>docker still uses {engine}</b>, so what you run in the terminal won't show up here. Your images can come along.", { engine: esc(ctxLabel(ui.status.context)) })}</span>
-    <button class="btn sm primary" data-ctxswitch>${tr("Switch to {app}", { app: esc(ui.status.app || "Kiri") })}</button>
-    <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
+  const pinned = ctxPinned();
+  if (pinned) {
+    el.innerHTML = `${ctxWarn("is-warn")}
+      <span class="is-text">${tr("{env} is set, so {docker} uses another engine instead of {app}. Unset it in your shell to use {app}.", { env: `<code>${esc(pinned)}</code>`, docker: "<code>docker</code>", app: esc(ui.status.app || "Kiri") })}</span>
+      <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
+  } else {
+    el.innerHTML = `${ctxWarn("is-warn")}
+      <span class="is-text">${tr("<b>docker still uses {engine}</b>, so what you run in the terminal won't show up here. Your images can come along.", { engine: esc(ctxLabel(ui.status.context)) })}</span>
+      <button class="btn sm primary" data-ctxswitch>${tr("Switch to {app}", { app: esc(ui.status.app || "Kiri") })}</button>
+      <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
+  }
   el.classList.add("ctx");
   el.hidden = false;
   return true;
@@ -4063,7 +4131,21 @@ function ctxImages(from) {
 function ctxDialog() {
   if (!ctxOther()) return;
   $("ctx-dlg")?.remove();
-  const from = ui.status.context, label = ctxLabel(from), app = ui.status.app || "Kiri";
+  const pinned = ctxPinned(), app = ui.status.app || "Kiri";
+  if (pinned) {
+    const cmd = WIN ? `Remove-Item Env:${esc(pinned)}` : `unset ${esc(pinned)}`;
+    const scrim = document.createElement("div");
+    scrim.className = "scrim"; scrim.id = "ctx-dlg";
+    scrim.innerHTML = `<div class="dialog ctx-dlg" role="dialog" aria-modal="true" aria-labelledby="ctx-h">
+      <h3 id="ctx-h">${tr("{env} is set", { env: esc(pinned) })}</h3>
+      <p class="muted" style="font-size:var(--fs);margin:8px 0 14px">${tr("{env} overrides docker's context in this session, so switching context won't move {docker} to {app}. Clear it with {cmd} or remove it from your profile.", { env: `<span class="mono">${esc(pinned)}</span>`, docker: "<code>docker</code>", app: esc(app), cmd: `<code>${cmd}</code>` })}</p>
+      <div class="ctx-foot"><span></span><span><button class="btn primary" data-close>${tr("OK")}</button></span></div></div>`;
+    document.body.append(scrim);
+    scrim.addEventListener("click", (ev) => { if (ev.target === scrim || ev.target.closest("[data-close]")) scrim.remove(); });
+    scrim.querySelector("[data-close]").focus();
+    return;
+  }
+  const from = ui.status.context, label = ctxLabel(from);
   const src = ui.imp.sources?.find((s) => s.id === from), imgs = ctxImages(from), inv = ui.imp.inv;
   if (src?.running && !imgs) send("inventory", { name: from });
   const bytes = (imgs || []).reduce((a, v) => a + ctxBytes(v.size), 0);
@@ -4334,16 +4416,64 @@ function buildsPane() {
   </div>`;
 }
 
-/* Settings → Network: the proxy for pulls and, if wanted, for containers. */
+/* Settings → Network: Docker's default socket + CLI binding, and the proxy. */
+function dockerSockRows() {
+  const app = ui.status?.app || "Kiri";
+  const mono = (t) => `<span class="mono">${esc(String(t))}</span>`;
+  const s = ui.dockersock;
+  let sockRow = "";
+  if (s) {
+    let desc = "", pact = "";
+    if (s.owner === "kiri") {
+      desc = tr("{path} leads to {app}. Tools like Testcontainers, IDE plugins and SDKs use it directly.", { path: mono(s.path), app: esc(app) });
+      pact = `<span class="pact kstate"><i class="on"></i>${esc(app)}</span>`;
+    } else if (s.owner === "other") {
+      const who = s.engine ? (s.target?.includes("/") ? `${esc(s.engine)} (${mono(s.target)})` : esc(s.engine)) : s.target ? mono(s.target) : tr("another engine");
+      desc = `${tr("{path} belongs to {engine} and stays so.", { path: mono(s.path), engine: who })}<br><span class="sockhint">${tr("Tools that ignore docker contexts can use {hint}", { hint: `<code>${esc(s.hint)}</code>` })}${copyBtn(s.hint, tr("command"))}</span>`;
+      pact = `<span class="pact kstate"><i></i>${s.engine ? esc(s.engine) : tr("In use")}</span>`;
+    } else {
+      desc = s.take
+        ? tr("{path} is free. Link it to {app} so tools that ignore docker contexts find {app} there.", { path: mono(s.path), app: esc(app) })
+        : WIN
+          ? tr("{path} is free. {app} serves it whenever it runs and no other Docker engine does.", { path: mono(s.path), app: esc(app) })
+          : LINUX
+            ? tr("{path} is free. {service} links it when Kiri starts while no other Docker engine has it.", { path: mono(s.path), service: mono("kiri.service") })
+            : tr("{path} is free. {app} leaves it for the installed Kiri.", { path: mono(s.path), app: esc(app) });
+      pact = s.take
+        ? `<span class="pact"><button class="btn primary" data-takesock${ui.sockTaking ? " disabled" : ""}>${ui.sockTaking ? tr("Linking…") : tr("Use {app}", { app: esc(app) })}</button></span>`
+        : `<span class="pact kstate"><i></i>${tr("Free")}</span>`;
+    }
+    sockRow = `<div class="pref"><span class="t">${tr("Docker socket")}</span><span class="d">${desc}</span>${pact}</div>`;
+  }
+  let cliRow = "";
+  if (ui.status) {
+    const pinned = ctxPinned();
+    let desc = "", pact = "";
+    if (!ctxOther()) {
+      desc = tr("The {docker} command uses {app}.", { docker: mono("docker"), app: esc(app) });
+      pact = `<span class="pact kstate"><i class="on"></i>${esc(app)}</span>`;
+    } else if (pinned) {
+      desc = tr("{env} is set in this session, so {docker} uses another engine.", { env: mono(pinned), docker: mono("docker") });
+      pact = `<span class="pact kstate"><i class="busy"></i>${esc(pinned)}</span>`;
+    } else {
+      desc = tr("The {docker} command uses {engine}.", { docker: mono("docker"), engine: esc(ctxLabel(ui.status.context)) });
+      pact = `<span class="pact"><button class="btn primary" data-usekiri${ui.ctxSwitching ? " disabled" : ""}>${ui.ctxSwitching ? tr("Switching…") : tr("Use {app}", { app: esc(app) })}</button></span>`;
+    }
+    cliRow = `<div class="pref"><span class="t">${tr("{docker} command", { docker: mono("docker") })}</span><span class="d">${desc}</span>${pact}</div>`;
+  }
+  return sockRow + cliRow;
+}
+
 function networkPane() {
-  const p = ui.proxy;
-  if (!p) return `<div class="pane"><h3>${tr("Network")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
-  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3><p class="muted">${tr("Start Kiri to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
+  const p = ui.proxy, sock = dockerSockRows();
+  if (!p) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}<p class="muted">${tr("Loading…")}</p></div>`;
+  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}<p class="muted">${tr("Start Kiri to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
   const d = ui.pxDraft, eff = p.effective;
   const seg = [["system", tr("{os} settings", { os: OS })], ["custom", tr("Custom")], ["none", tr("None")]].map(([v, l]) => `<button data-pxmode="${v}" aria-pressed="${d.mode === v}">${l}</button>`).join("");
   const now = eff.https || eff.http ? (eff.no_proxy.length ? tr("In use: {proxy}, except {hosts}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>`, hosts: `<span class="mono">${esc(eff.no_proxy.join(", "))}</span>` }) : tr("In use: {proxy}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>` })) : tr("No proxy is in use.");
   const field = (k, label, ph) => `<label class="pxf"><span>${label}</span><input class="field" id="px-${k}" value="${esc(d[k] || "")}" placeholder="${ph}" spellcheck="false" autocomplete="off"></label>`;
   return `<div class="pane"><h3>${tr("Network")}</h3>
+    ${sock}
     <div class="pref"><span class="t">${tr("Proxy")}</span><span class="d">${tr("For pulling and pushing images.")} ${d.mode === p.settings.mode ? now : ""}</span>
       <div class="seg" role="group" aria-label="${tr("Proxy")}">${seg}</div></div>
     ${d.mode === "system" && eff.pac ? `<p class="muted">${tr("{os} uses an automatic proxy configuration (PAC) file, which Kiri can't follow. Choose Custom and enter the proxy.", { os: OS })}</p>` : ""}
@@ -4376,6 +4506,7 @@ function routerPortsPref() {
 
 /* Settings → Resources: the most the Linux VM may use. */
 const gb = (mib) => `${Math.round(mib / 1024)} GB`;
+const diskGb = (g) => `${g} GB`;
 const cpuText = (n) => trn(n, "{n} CPU", "{n} CPUs");
 /* How far along its track a slider's blue fill reaches, as CSS: to the
    middle of the thumb, which travels the track less its own 26 px. */
@@ -4383,7 +4514,7 @@ const rangeFill = (v, min, max) => {
   const f = max > min ? (v - min) / (max - min) : 0;
   return `calc(13px + (100% - 26px) * ${f.toFixed(4)})`;
 };
-const resChanged = () => ui.res && (ui.resDraft.cpus !== ui.res.cpus || ui.resDraft.memory_mib !== ui.res.memory_mib);
+const resChanged = () => ui.res && (ui.resDraft.cpus !== ui.res.cpus || ui.resDraft.memory_mib !== ui.res.memory_mib || (ui.res.disk_gb != null && ui.resDraft.disk_gb !== ui.res.disk_gb));
 /* Settings › Resources: the engine's on/off, the same switch as the card. */
 function enginePane() {
   const { shown } = engineShown(), off = shown === "stopped";
@@ -4403,19 +4534,155 @@ function resourcesPane() {
   if (r.error) return `<div class="pane"><h3>${tr("Resources")}</h3><p class="muted">${tr("Start Kiri to change its resources. ({error})", { error: esc(r.error) })}</p></div>`;
   const d = ui.resDraft;
   const maxGb = Math.max(1, Math.floor(r.max_memory_mib / 1024));
-  const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64);
+  const hasDisk = r.disk_gb != null;
+  const minDisk = r.min_disk_gb ?? 64;
+  const maxDisk = Math.max(minDisk, r.max_disk_gb ?? 1024);
+  const diskVal = hasDisk ? Math.min(Math.max(d.disk_gb ?? r.disk_gb, minDisk), maxDisk) : minDisk;
+  const diskStep = minDisk % 8 === 0 && diskVal % 8 === 0 && maxDisk % 8 === 0 ? 8 : 1;
+  const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64 || (hasDisk && r.running_disk_gb != null && r.running_disk_gb !== r.disk_gb));
   return `<div class="pane"><h3>${tr("Resources")}</h3>
     <div class="pref"><span class="t">${tr("CPUs")}</span><span class="d">${tr("Shared with {os}: the VM only uses them while containers are busy.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-cpus" min="1" max="${r.max_cpus}" step="1" value="${d.cpus}" aria-label="${tr("CPUs")}" style="--fill:${rangeFill(d.cpus, 1, r.max_cpus)}"><span class="num" id="res-cpus-v">${cpuText(d.cpus)}</span></div></div>
     <div class="pref"><span class="t">${tr("Memory")}</span><span class="d">${tr("The most the VM may take. It uses memory only as containers need it and gives the rest back to {os}.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-mem" min="1024" max="${maxGb * 1024}" step="1024" value="${Math.min(d.memory_mib, maxGb * 1024)}" aria-label="${tr("Memory")}" style="--fill:${rangeFill(Math.min(d.memory_mib, maxGb * 1024), 1024, maxGb * 1024)}"><span class="num" id="res-mem-v">${gb(d.memory_mib)}</span></div></div>
-    ${r.overridden ? `<p class="muted">${tr("KIRI_CPUS or KIRI_MEMORY_MIB is set for the daemon, and it takes precedence over these.")}</p>` : ""}
-    <div class="res-foot"><span class="muted">${r.awake ? tr("Running now with {cpus} and up to {mem}.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib) }) : tr("The VM is asleep; it starts with these next time.")}</span>
+    ${hasDisk ? `<div class="pref"><span class="t">${tr("Disk image size")}</span><span class="d">${tr("The most the VM disk may grow to. Space is used on {os} only as data is written; it never shrinks. Applies on restart.", { os: OS })}</span>
+      <div class="range"><input type="range" id="res-disk" min="${minDisk}" max="${maxDisk}" step="${diskStep}" value="${diskVal}" aria-label="${tr("Disk image size")}" style="--fill:${rangeFill(diskVal, minDisk, maxDisk)}"><span class="num" id="res-disk-v">${diskGb(diskVal)}</span></div></div>` : ""}
+    ${r.overridden ? `<p class="muted">${hasDisk ? tr("KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.") : tr("KIRI_CPUS or KIRI_MEMORY_MIB is set for the daemon, and it takes precedence over these.")}</p>` : ""}
+    <div class="res-foot"><span class="muted">${r.awake ? (hasDisk ? tr("Running now with {cpus}, up to {mem}, and a {disk} disk.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib), disk: diskGb(r.running_disk_gb ?? r.disk_gb) }) : tr("Running now with {cpus} and up to {mem}.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib) })) : tr("The VM is asleep; it starts with these next time.")}</span>
       <span style="flex:1"></span>
       ${pending ? `<button class="btn" id="res-restart" data-restartvm>${tr("Restart VM to apply")}</button>` : ""}
       <button class="btn primary" id="res-save" data-saveres${resChanged() ? "" : " disabled"}>${tr("Save")}</button></div>
     ${pending ? `<p class="muted">${esc(r.restart_note || tr("Restarting stops the running containers; start them again afterwards."))}</p>` : ""}
   </div>`;
+}
+
+function wslPane() {
+  const list = ui.res?.wsl_distros;
+  if (!WIN && !Array.isArray(list)) return "";
+  if (!Array.isArray(list)) return `<div class="pane"><h3>${tr("WSL integration")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (!list.length) return `<div class="pane"><h3>${tr("WSL integration")}</h3><p class="muted">${tr("No other WSL distros installed.")}</p></div>`;
+  const rows = list.map((w) => `<div class="pref"><span class="t">${esc(w.name)}</span><span class="d">${tr("docker, Compose and Docker-socket tools reach Kiri")}</span>
+    <div class="seg" role="group" aria-label="${esc(w.name)}"><button data-wsldistro="${esc(w.name)}" data-wslon="0" aria-pressed="${!w.on}">${tr("Off")}</button><button data-wsldistro="${esc(w.name)}" data-wslon="1" aria-pressed="${!!w.on}">${tr("On")}</button></div></div>`).join("");
+  return `<div class="pane"><h3>${tr("WSL integration")}</h3>${rows}</div>`;
+}
+
+/* Settings → Storage: where Kiri keeps images, containers, and volumes. */
+const stPhaseText = (p) => ({
+  stopping: tr("Stopping containers…"),
+  copying: tr("Copying data…"),
+  verifying: tr("Verifying copy…"),
+  switching: tr("Switching storage…"),
+  restarting: tr("Restarting engine…"),
+}[p] || tr("Moving data…"));
+
+function storageUnavailableBox(s, linkSettings) {
+  return `<div class="st-box warn" role="alert">
+    <div class="st-hd"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg><span>${tr("Storage location unavailable")}</span></div>
+    <p>${tr("Kiri couldn't find its data in {path}. Connect its drive and retry, choose another folder, or reset to the default location.", { path: `<span class="mono st-path">${esc(s.path || "")}</span>` })}</p>
+    <div class="st-row">
+      <button class="btn primary" data-stretry>${tr("Retry")}</button>
+      <button class="btn" data-stpick>${tr("Change…")}</button>
+      <button class="btn" data-streset>${tr("Reset to default")}</button>
+      ${linkSettings ? `<button class="btn" data-stgoto>${tr("Open storage settings")}</button>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderStorageUnavailable() {
+  const s = ui.storage || {};
+  $("content").innerHTML = `<div class="empty"><div><svg class="i art" viewBox="0 0 256 256"><path d="${PH.harddrive}"/></svg>
+    <h3>${tr("Storage location unavailable")}</h3>
+    <p>${tr("Kiri couldn't find its data in {path}. Connect its drive and retry, choose another folder, or reset to the default location.", { path: `<span class="mono st-path">${esc(s.path || "")}</span>` })}</p>
+    <div class="st-row" style="justify-content:center">
+      <button class="btn primary" data-stretry>${tr("Retry")}</button>
+      <button class="btn" data-stpick>${tr("Change…")}</button>
+      <button class="btn" data-streset>${tr("Reset to default")}</button>
+      <button class="btn" data-stgoto>${tr("Open storage settings")}</button>
+    </div></div></div>`;
+}
+
+function storagePane() {
+  const s = ui.storage;
+  if (!s) return `<div class="pane"><h3>${tr("Storage")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (s.error && !s.path) return `<div class="pane"><h3>${tr("Storage")}</h3><p class="muted">${tr("Start Kiri to change its storage location. ({error})", { error: esc(s.error) })}</p></div>`;
+  const moving = s.state === "moving", unavail = s.state === "unavailable", locked = moving || !!s.env;
+  const stats = [s.used != null ? tr("{size} used", { size: size(s.used) }) : "", s.free != null ? tr("{size} free", { size: size(s.free) }) : "", s.fs ? esc(s.fs) : ""].filter(Boolean).join(" · ");
+  const badge = !s.custom && !s.env ? `<span class="st-badge">${tr("Default")}</span>` : "";
+  const m = s.moving;
+  const pct = m && m.total > 0 ? Math.min(100, Math.round((m.done / m.total) * 100)) : null;
+  const progressBox = moving && m ? `<div class="st-box" role="status">
+    <div class="st-hd"><span>${stPhaseText(m.phase)}</span></div>
+    <p>${tr("Moving Kiri's data to {path}.", { path: `<span class="mono st-path">${esc(m.to || "")}</span>` })}</p>
+    ${pct != null ? `<div class="st-bar"><span style="width:${pct}%"></span></div><p class="num">${size(m.done)} / ${size(m.total)} (${pct}%)</p>` : ""}
+    <p>${tr("Running containers pause while Kiri copies its data and start again once it's done.")}</p>
+  </div>` : "";
+  const errText = ui.stErr || (!moving && s.error ? s.error : "");
+  const errBox = errText ? `<div class="st-box err" role="alert">
+    <div class="st-hd"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg><span>${tr("Couldn't change storage location")}</span></div>
+    <p>${esc(errText)}</p>
+    ${ui.stErr ? `<div class="st-row"><button class="btn sm" data-sterrclose>${tr("Dismiss")}</button></div>` : ""}
+  </div>` : "";
+  const oldRow = s.old && s.state === "ok" ? `<div class="pref st-pref">
+    <span class="t">${tr("Old data")}</span>
+    <span class="d">${tr("Previous data is still in {path}. Remove it once everything works in the new location.", { path: `<span class="mono st-path">${esc(s.old)}</span>` })}</span>
+    <span class="st-acts"><button class="btn" data-strmold>${tr("Remove old data")}</button></span>
+  </div>` : "";
+  return `<div class="pane"><h3>${tr("Storage")}</h3>
+    ${unavail ? storageUnavailableBox(s, false) : ""}
+    <div class="pref st-pref">
+      <span class="t st-t"><span>${tr("Storage location")}</span>${badge}</span>
+      <span class="d"><span class="mono st-path">${esc(s.path || "")}</span>${stats ? `<span class="st-meta">${stats}</span>` : ""}</span>
+      <span class="st-acts">
+        <button class="btn" data-stpick${locked ? " disabled" : ""}>${tr("Change…")}</button>
+        ${s.custom ? `<button class="btn" data-streset${locked ? " disabled" : ""}>${tr("Reset to default")}</button>` : ""}
+      </span>
+    </div>
+    ${s.env ? `<p class="muted">${tr("{var} sets Kiri's storage location, so it can't be changed here.", { var: `<span class="mono">KIRI_DATA_DIR</span>` })}</p>` : ""}
+    ${progressBox}
+    ${errBox}
+    ${oldRow}
+    <p class="muted">${tr("Images, containers, and volumes live in this folder. External drives must use a native filesystem (APFS on macOS, ext4/xfs/btrfs on Linux, NTFS on Windows); FAT and exFAT drives aren't supported.")}</p>
+  </div>`;
+}
+
+function storageConfirm(c) {
+  $("st-dlg")?.remove();
+  const s = ui.storage || {};
+  const unavail = s.state === "unavailable";
+  const hasData = !unavail && ((s.used || 0) > 0 || ui.containers.length > 0 || ui.images.length > 0 || ui.volumes.length > 0);
+  const showMode = !c.reset && hasData;
+  const title = c.reset ? tr("Reset storage location to default?") : tr("Change storage location?");
+  const meta = !unavail && c.free != null ? `<p>${tr("Destination: {path} ({free} free).", { path: `<span class="mono st-path">${esc(c.path)}</span>`, free: size(c.free) })}</p>`
+    : `<p>${tr("Destination: {path}.", { path: `<span class="mono st-path">${esc(c.path)}</span>` })}</p>`;
+  const warn = c.replaces ? `<p>${tr("Existing Kiri data in this folder will be replaced.")}</p>` : "";
+  const modeHtml = showMode ? `<div class="st-opts" role="radiogroup" aria-label="${tr("Migration mode")}">
+    <label class="st-opt"><input type="radio" name="st-mode" value="move" checked><b>${tr("Move existing images, containers, and volumes")}</b><small>${tr("Stops running containers, copies your data, and starts them again.")}</small></label>
+    <label class="st-opt"><input type="radio" name="st-mode" value="fresh"><b>${tr("Start fresh")}</b><small>${tr("Starts empty in the new folder. Your old folder stays until you remove it.")}</small></label>
+  </div>` : `<p>${unavail ? tr("Kiri will switch to this folder and restart the engine.") : tr("Running containers will stop while Kiri moves your data and start again once it's done.")}</p>`;
+  const scrim = document.createElement("div");
+  scrim.className = "scrim"; scrim.id = "st-dlg";
+  scrim.innerHTML = `<div class="dialog alert" role="dialog" aria-modal="true" aria-labelledby="st-h">${alertIco(c.replaces ? "warn" : "info")}<h3 id="st-h">${title}</h3>
+    ${meta}${warn}${modeHtml}
+    <div class="row-end"><span></span><span><button class="btn" data-stcancel>${tr("Cancel")}</button> <button class="btn primary" data-stgo>${c.reset ? tr("Reset to default") : tr("Move data")}</button></span></div></div>`;
+  document.body.append(scrim);
+  const goBtn = scrim.querySelector("[data-stgo]");
+  const close = () => { scrim.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  scrim.querySelectorAll('input[name="st-mode"]').forEach((r) => r.addEventListener("change", () => {
+    goBtn.textContent = r.value === "fresh" && r.checked ? tr("Start fresh") : tr("Move data");
+  }));
+  scrim.addEventListener("click", (ev) => {
+    if (ev.target === scrim || ev.target.closest("[data-stcancel]")) return close();
+    if (ev.target.closest("[data-stgo]")) {
+      const fresh = scrim.querySelector('input[name="st-mode"]:checked')?.value === "fresh";
+      ui.stErr = "";
+      if (c.reset) send("storagereset");
+      else send("storagemove", { path: c.path, value: { fresh } });
+      close();
+    }
+  });
+  goBtn.focus();
 }
 
 function renderSettings() {
@@ -4438,6 +4705,8 @@ function renderSettings() {
   };
   const inUse = darkNow();
   const sysName = LANGS.find(([id]) => id === resolveLang("system"))?.[1] || "English";
+  const startAtLogin = prefs.startAtLogin ?? !LINUX;
+  const stopOnQuit = prefs.stopOnQuit === true;
   const appearance = `<div class="pane"><h3>${tr("Appearance")}</h3>
     <div class="pref"><span class="t" id="pref-lang-t">${tr("Language")}</span><span class="d">${tr("Follow {os} (now {lang}), or always use one language.", { os: OS, lang: sysName })}</span>
       ${langButton(sysName)}
@@ -4455,7 +4724,15 @@ function renderSettings() {
       <div class="seg" role="group" aria-label="${tr("Text size")}">${SIZES.map((z) => `<button data-scale="${z}" aria-pressed="${Math.abs((prefs.scale || 1) - z) < 0.01}">${Math.round(z * 100)}%</button>`).join("")}</div></div>
     <div class="pref"><span class="t">${tr("Log text")}</span><span class="d">${tr("Container, Kubernetes and diagnostics logs.")}</span>
       <div class="seg" role="group" aria-label="${tr("Log text")}">${LOG_SIZES.map(([px, l]) => `<button data-logsize="${px}" aria-pressed="${prefs.logSize === px}">${tr(l)}</button>`).join("")}</div></div>
+    <div class="pref"><span class="t">${tr("Closing the window")}</span><span class="d">${prefs.closeButton === "close"
+      ? tr("Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.")
+      : tr("Hide: the window stays ready and opens again at once.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Closing the window")}"><button data-closebtn="hide" aria-pressed="${prefs.closeButton !== "close"}">${tr("Hide")}</button><button data-closebtn="close" aria-pressed="${prefs.closeButton === "close"}">${tr("Close")}</button></div></div>
     <div class="preview"><div class="p-title">web · nginx:alpine</div><div>Up 3 minutes · 26.3 MB · localhost:8080 → 80</div><div class="p-mono">ef9a6e2b45c2  docker run -p 8080:80 nginx</div></div>
+    <div class="pref"><span class="t">${tr("Start Kiri at sign-in")}</span><span class="d">${tr("Start Kiri in the background when you sign in.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Start Kiri at sign-in")}"><button data-startlogin="0" aria-pressed="${!startAtLogin}">${tr("Off")}</button><button data-startlogin="1" aria-pressed="${startAtLogin}">${tr("On")}</button></div></div>
+    <div class="pref"><span class="t">${tr("Stop the engine when Kiri quits")}</span><span class="d">${tr("Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Stop the engine when Kiri quits")}"><button data-stopquit="0" aria-pressed="${!stopOnQuit}">${tr("Off")}</button><button data-stopquit="1" aria-pressed="${stopOnQuit}">${tr("On")}</button></div></div>
   </div>`;
   const portsPref = routerPortsPref();
   // On Linux: kiri.localhost only, for now; nothing to switch.
@@ -4502,8 +4779,8 @@ function renderSettings() {
       <dt>${tr("Made by")}</dt><dd><a data-open-site="https://canestack.com">Canestack Labs</a></dd>
     </dl>
     <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p></div>`;
-  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
-    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
+  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("storage", "harddrive", tr("Storage"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${tab("registries", "lock", tr("Registries"))}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
+    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}${wslPane()}</div>` : prefs.tab === "storage" ? storagePane() : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" ? `<div class="panes">${loginsOn() ? registriesPane() : ""}${regListPane("insecure")}${regListPane("mirrors")}</div>` : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
   // closes an open menu. The font menus list names in the interface font: an
   // option in its own font made WebKit load every installed font (438 here)
@@ -4516,6 +4793,10 @@ function renderSettings() {
   settingsShown.html = html; settingsShown.el = $("content").firstElementChild;
   diagDrawn();
   for (const k of ["http", "https", "no_proxy"]) $(`px-${k}`)?.addEventListener("input", (ev) => { ui.pxDraft[k] = ev.target.value; });
+  for (const k of ["insecure", "mirrors"]) {
+    $(`reg-${k}`)?.addEventListener("input", (ev) => { ui.regAdd[k] = ev.target.value; });
+    $(`reg-${k}`)?.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); regListAdd(k); } });
+  }
   for (const k of ["http", "https"]) $(`rp-${k}`)?.addEventListener("input", (ev) => {
     ui.rpDraft[k] = ev.target.value;
     const save = document.querySelector("#content [data-saverp]");
@@ -4527,10 +4808,11 @@ function renderSettings() {
     const go = document.querySelector("#content [data-impgo]"), n = importCount();
     if (go) { go.disabled = !n; go.textContent = n ? trn(n, "Import {n} item", "Import {n} items") : tr("Import"); }
   }));
-  for (const id of ["res-cpus", "res-mem"]) $(id)?.addEventListener("input", (ev) => {
-    ui.resDraft[id === "res-cpus" ? "cpus" : "memory_mib"] = +ev.target.value;
-    ev.target.style.setProperty("--fill", rangeFill(+ev.target.value, +ev.target.min, +ev.target.max));
-    $(`${id}-v`).textContent = id === "res-cpus" ? cpuText(+ev.target.value) : gb(+ev.target.value);
+  for (const id of ["res-cpus", "res-mem", "res-disk"]) $(id)?.addEventListener("input", (ev) => {
+    const v = +ev.target.value;
+    ui.resDraft[id === "res-cpus" ? "cpus" : id === "res-mem" ? "memory_mib" : "disk_gb"] = v;
+    ev.target.style.setProperty("--fill", rangeFill(v, +ev.target.min, +ev.target.max));
+    $(`${id}-v`).textContent = id === "res-cpus" ? cpuText(v) : id === "res-mem" ? gb(v) : diskGb(v);
     $("res-save").disabled = !resChanged();
   });
   $("pref-font")?.addEventListener("change", (ev) => setPref("font", ev.target.value));
@@ -4553,7 +4835,7 @@ function show(view) {
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("storage"); send("dockersock"); send("proxy"); send("registryconfig"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -4766,6 +5048,8 @@ function sortBy(items, view, keys) {
   });
 }
 const match = (...fields) => !ui.filter || fields.some((f) => String(f || "").toLowerCase().includes(ui.filter.toLowerCase()));
+const matchContainer = (c) => match(c.Names[0], c.Image) ||
+  (c.Ports || []).some((p) => match(p.PublicPort, p.PrivatePort));
 // The tab is said too, when it narrows the list as well.
 function noMatch() {
   const tab = LISTS[ui.view]?.tabs?.find(([k]) => k === tabOf(ui.view))?.[1];
@@ -6911,6 +7195,7 @@ function render() {
   if (v === "share") return renderShare();
   // The devices are the computer's: listed whether the engine runs or not.
   if (v === "usb") return renderUsb();
+  if (ui.storage?.state === "unavailable") return renderStorageUnavailable();
   if (ui.vm === "stopped") return renderEmpty("stopped");
   if ((v === "containers" || v === "compose") && ui.detail) {
     // The list refreshes while you edit the environment: keep your place.
@@ -6974,6 +7259,9 @@ function paintEngine() {
   if (document.body.classList.contains("rail")) document.querySelector(".vm").title = `${tr(VM)}: ${label}`;
   const b = $("vm-toggle");
   b.hidden = false;
+  /* When it last turned into a Stop button: see the press guard below. */
+  const act = shown === "running" ? "stop" : "start";
+  if (b.dataset.act !== act) { b.dataset.act = act; b.dataset.flipped = String(Date.now()); }
   b.textContent = shown === "running" ? tr("Stop") : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : tr("Start");
   b.classList.toggle("primary", shown !== "running");
   b.disabled = shown === "booting" || shown === "stopping";
@@ -8082,6 +8370,7 @@ window.kiri = {
       case "onboarding": onboarding(e); break;
       case "buildask": buildAsk(e.engine); break;
       case "buildwith": ui.bw = e; if (ui.view === "settings") render(); break;
+      case "dockersock": ui.dockersock = e; ui.sockTaking = false; if (ui.view === "settings") render(); break;
       case "status":
         ui.status = e;
         document.body.classList.toggle("dev", !!e.dev);
@@ -8112,7 +8401,9 @@ window.kiri = {
       case "share": case "shares": case "shareaccount": case "sharelogin": case "shareusage": case "sharetunnels": case "sharetraffic": shEvent(e); break;
       case "builds": {
         const b = ui.bl;
-        b.items = e.builds || b.items || []; b.error = e.error || "";
+        // Two builders can share one BuildKit (kiri and kiri-build): its builds come once per builder, and are one build.
+        const seen = new Set();
+        b.items = (e.builds || b.items || []).filter((x) => !seen.has(x.id) && seen.add(x.id)); b.error = e.error || "";
         const sel = b.sel && b.items.find((x) => x.id === b.sel.id);
         if (!sel && b.items.length) pickBuild(b.items[0]);
         else if (sel && (sel.status === "Running" || sel.status !== b.sel.status)) { b.sel = sel; send("build", { name: sel.builder, id: sel.id }); }
@@ -8133,14 +8424,52 @@ window.kiri = {
       case "imagelayers": if (ui.imgd?.name === e.name) { ui.imgd.layers = e; if (ui.view === "images") render(); } break;
       case "buildlayers": if (ui.bl.sel?.id === e.id) { ui.bl.layers = e; if (ui.view === "builds") renderBuilds(); } break;
       case "build": if (ui.bl.sel?.id === e.id) { ui.bl.d = e; if (ui.view === "builds") renderBuilds(); } break;
-      case "usedcontext": if (e.error) toast("error", tr("Couldn't switch docker: {error}", { error: e.error })); break;
+      case "usedcontext": ui.ctxSwitching = false; if (e.error) toast("error", tr("Couldn't switch docker: {error}", { error: e.error })); if (ui.view === "settings") render(); break;
       case "importsources": ui.imp.sources = e.sources; { const s = e.sources.find((x) => x.id === ui.imp.source) || e.sources.find((x) => x.running && x.id === ui.status?.context) || e.sources.find((x) => x.running) || e.sources[0]; if (s) { ui.imp.source = s.id; if (s.running) send("inventory", { name: s.id }); } } if (ui.view === "settings") render(); break;
       case "inventory": ui.imp.inv = e; if (ui.view === "settings") render(); renderImportStrip(); drawImportModal(); break;
       case "importstep": ctxStep(e); ui.imp.steps[`${e.kind}/${e.name}`] = e; if (e.state !== "running") ui.imp.picked[e.kind].delete(e.name); if (ui.view === "settings") render(); drawImportModal(); break;
       case "importdone": if (ctx.card?.total) { ctx.card.finished = true; drawCtxCard(); } ui.imp.running = false; ui.imp.summary = e.failed ? tr("Imported {done}; {failed} failed (hover “Failed” for why).", { done: e.done, failed: e.failed }) : trn(e.done, "Imported {n} item.", "Imported {n} items."); send("inventory", { name: ui.imp.source }); toast(e.failed ? "error" : "ok", ui.imp.summary); drawImportModal(); break;
       case "routerports": ui.rports = e; ui.rpDraft = {}; render(); break;
       case "proxy": ui.proxy = e; ui.pxDraft = { ...(e.settings || {}) }; if (ui.view === "settings") render(); break;
-      case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib }; if (ui.view === "settings") render(); break;
+      case "registryconfig": {
+        // A list with edits not yet saved keeps them: saving the other list,
+        // a save the daemon refused, a read that crossed a save, or a daemon
+        // that went away must not throw them away. A list takes the file's
+        // version when it has no edits (against the last file read), or when
+        // it is the one this save saved (`saved`, only on a save's answer),
+        // even if the file reads the same as before (the save wrote what
+        // was typed in the file's own spelling). What is typed in a field
+        // and not added yet goes only with its own list's save.
+        const answer = "saved" in e, saving = answer ? ui.regSaving : null;
+        if (answer) ui.regSaving = null;
+        if (!e.error) {
+          const base = ui.regBase;
+          const same = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || []);
+          for (const k of Object.keys(REG_KEY)) {
+            const fresh = e[REG_KEY[k]] || [];
+            const clean = !base || same(ui.regDraft[k], base[REG_KEY[k]]);
+            const savedNow = saving === k && e.saved === true;
+            if (clean || savedNow) ui.regDraft[k] = [...fresh];
+            if (savedNow) ui.regAdd[k] = "";
+          }
+          ui.regBase = e;
+        }
+        ui.regcfg = e;
+        if (ui.view === "settings") render();
+        break;
+      }
+      case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib, ...(e.disk_gb != null ? { disk_gb: e.disk_gb } : {}) }; if (ui.view === "settings") render(); break;
+      case "storage": {
+        const wasUnavail = ui.storage?.state === "unavailable";
+        ui.storage = e;
+        if (e.state === "moving") ui.stErr = "";
+        if (ui.view === "settings" || e.state === "unavailable" || wasUnavail) render();
+        break;
+      }
+      case "storagecheck":
+        if (e.error) { ui.stErr = e.error; if (ui.view === "settings") render(); else toast("error", e.error); }
+        else { ui.stErr = ""; storageConfirm(e); }
+        break;
       case "detail": openDetail(e.id); break;
       case "inspect":
         if (ui.detail?.id === e.id) {
@@ -8240,10 +8569,26 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "storage") send("storage"); if (prefs.tab === "network") { send("proxy"); send("dockersock"); } if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") { send("logins"); send("registryconfig"); } if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if (t("[data-stpick]")) { ui.stErr = ""; send("storagepick"); }
+  else if (t("[data-streset]")) {
+    if (ui.storage?.state === "unavailable") {
+      confirmRemove(tr("Reset storage location to default?"), tr("Kiri will switch back to its default folder and restart the engine. Data on the disconnected drive isn't deleted."), tr("Reset to default"), () => send("storagereset"), "primary");
+    } else {
+      ui.stErr = "";
+      send("storagecheck", { path: "", value: { reset: true } });
+    }
+  }
+  else if (t("[data-stretry]")) { ui.stErr = ""; send("storageretry"); }
+  else if (t("[data-strmold]")) { confirmRemove(tr("Remove old data?"), tr("Everything in {path} will be deleted for good.", { path: `<span class="mono st-path">${esc(ui.storage?.old || "")}</span>` }), tr("Remove"), () => send("storageremoveold")); }
+  else if (t("[data-sterrclose]")) { ui.stErr = ""; render(); }
+  else if (t("[data-stgoto]")) { prefs.tab = "storage"; show("settings"); }
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
+  else if ((el = t("[data-closebtn]"))) setPref("closeButton", el.dataset.closebtn);
+  else if ((el = t("[data-startlogin]"))) setPref("startAtLogin", el.dataset.startlogin === "1");
+  else if ((el = t("[data-stopquit]"))) setPref("stopOnQuit", el.dataset.stopquit === "1");
   else if ((el = t("[data-theme-pick]"))) setPref("theme", el.dataset.themePick);
   else if ((el = t("[data-accent]"))) setPref("accent", el.dataset.accent);
   else if (t("[data-buildprune]")) { ui.bwPruning = true; send("buildprune"); render(); }
@@ -8259,8 +8604,18 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-pxmode]"))) { ui.pxDraft.mode = el.dataset.pxmode; render(); }
   else if ((el = t("[data-pxc]"))) { ui.pxDraft.containers = !!+el.dataset.pxc; render(); }
   else if ((el = t("[data-savepx]"))) send("setproxy", { value: ui.pxDraft });
+  else if (t("[data-takesock]")) { ui.sockTaking = true; send("takesocket"); render(); }
+  else if (t("[data-usekiri]")) { ui.ctxSwitching = true; send("usecontext", { name: ui.status.ours }); render(); }
+  else if ((el = t("[data-regadd]"))) regListAdd(el.dataset.regadd);
+  else if ((el = t("[data-regdel]"))) { const [k, i] = el.dataset.regdel.split(":"); ui.regDraft[k].splice(+i, 1); render(); }
+  else if ((el = t("[data-regsave]"))) { ui.regSaving = el.dataset.regsave; send("setregistryconfig", { value: { [REG_KEY[el.dataset.regsave]]: ui.regDraft[el.dataset.regsave] } }); }
   else if ((el = t("[data-saverp]")) && ui.rports && !ui.rports.error) send("setrouterports", { value: { http: +(ui.rpDraft.http ?? ui.rports.http.port), https: +(ui.rpDraft.https ?? ui.rports.https.port) } });
   else if ((el = t("[data-saveres]"))) send("setresources", { value: ui.resDraft });
+  else if ((el = t("[data-wsldistro]"))) {
+    const name = el.dataset.wsldistro, on = el.dataset.wslon === "1";
+    const cur = ui.res?.wsl_distros?.find((d) => d.name === name);
+    if (cur && !!cur.on !== on) { cur.on = on; send("setresources", { value: { wsl_distro: name, on } }); render(); }
+  }
   else if ((el = t("[data-vmpower]"))) { el.disabled = true; powerEngine(el.dataset.vmpower); }
   else if ((el = t("[data-restartvm]"))) { el.disabled = true; el.textContent = tr("Restarting…"); send("restartvm"); }
   else if ((el = t("[data-detail]"))) openDetail(el.dataset.detail);
@@ -8333,7 +8688,23 @@ document.addEventListener("keydown", (ev) => {
     f.focus(); f.select();
   }
 });
-$("vm-toggle").addEventListener("click", () => powerEngine(engineShown().shown === "running" ? "stop" : "start"));
+/* The card's one button reads Start or Stop and turns over when the engine's
+   state changes, often just as the engine comes back while someone reaches
+   for Start. A press that began on Start, or within half a second of it
+   turning to Stop, is not a Stop: that recorded a Stop nobody asked for,
+   and docker then said "Kiri is stopped" until Start (#93). */
+$("vm-toggle").addEventListener("pointerdown", (ev) => {
+  const b = ev.currentTarget;
+  b.dataset.pressed = b.dataset.act === "stop" && Date.now() - Number(b.dataset.flipped || 0) < 500 ? "start" : b.dataset.act || "";
+});
+/* A press dragged off the button is over: a later press by keyboard is its own. */
+$("vm-toggle").addEventListener("pointerleave", (ev) => { delete ev.currentTarget.dataset.pressed; });
+$("vm-toggle").addEventListener("click", (ev) => {
+  const b = ev.currentTarget, act = engineShown().shown === "running" ? "stop" : "start", pressed = b.dataset.pressed;
+  delete b.dataset.pressed;
+  if (pressed && pressed !== act) return;
+  powerEngine(act);
+});
 
 /* Window chrome: a mouse-down on empty header or sidebar space drags the
    window, and a double-click zooms it, like a native title bar. */
@@ -9153,7 +9524,7 @@ setInterval(() => {
 }, 4000);
 // Animations rest while another window is in front, or this one is hidden.
 const away = () => document.body.classList.toggle("away", document.hidden || !document.hasFocus());
-addEventListener("focus", away); addEventListener("blur", away); document.addEventListener("visibilitychange", away);
+addEventListener("focus", () => { away(); send("dockersock"); }); addEventListener("blur", away); document.addEventListener("visibilitychange", away);
 // The crane's sway (.is-art), once every 20 s while Kiri is the window in use.
 setInterval(() => {
   document.body.classList.remove("sway");
@@ -10093,7 +10464,7 @@ const BUILTIN_NETS = new Set(["bridge", "host", "none"]);
 const LISTS = {
   containers: {
     // The containers of no Compose project: a project's are in Compose, where its file says what runs.
-    all: () => ui.containers.filter((c) => !c.Labels?.["com.docker.compose.project"]), key: (c) => c.Id, name: cname, hit: (c) => match(c.Names[0], c.Image), noun: "containers",
+    all: () => ui.containers.filter((c) => !c.Labels?.["com.docker.compose.project"]), key: (c) => c.Id, name: cname, hit: matchContainer, noun: "containers",
     state: ctrState,
     tabs: [["running", "Running", "moss"], ["stopped", "Stopped", ""], ["failed", "Failed", "red", true]],
     junk: { state: "failed", label: (n) => tr("Clear {n} failed", { n }), what: "failed containers",
@@ -10137,7 +10508,7 @@ const LISTS = {
   services: { all: () => k8s.services, key: (s) => `${s.ns}/${s.name}`, name: (s) => s.name, hit: (s) => match(s.name, s.ns, s.type), noun: "services" },
   // Compose: its projects' containers, as Containers has them, with no boxes (no Delete: the file says what runs).
   compose: {
-    all: () => ui.containers.filter(cmpOf), key: (c) => c.Id, name: cname, hit: (c) => match(c.Names[0], c.Image, cmpOf(c)), noun: "containers",
+    all: () => ui.containers.filter(cmpOf), key: (c) => c.Id, name: cname, hit: (c) => matchContainer(c) || match(cmpOf(c)), noun: "containers",
     state: ctrState, tabs: [["running", "Running", "moss"], ["stopped", "Stopped", ""], ["failed", "Failed", "red", true]],
     shown: (c) => !ui.collapsed.has(cmpOf(c)),
     // Open project first; one opened from its file and never started is only taken off the list.
@@ -11018,6 +11389,39 @@ function loginDone(e) {
   }
   signinRedraw();
   if (failed) document.querySelector(`[data-signin="${CSS.escape(failed)}"] [name="t"]`)?.select();
+}
+/* Settings → Registries: Kiri's daemon.json lists, with Docker's names
+   (`insecure-registries`, `registry-mirrors`), the same ones `kiri registry`
+   edits. Insecure: only the hosts and networks listed go without a checked
+   certificate. Mirrors: Docker Hub's, tried in order before Docker Hub. */
+const REG_KEY = { insecure: "insecure-registries", mirrors: "registry-mirrors" };
+function regListPane(k) {
+  const c = ui.regcfg, title = k === "insecure" ? tr("Insecure registries") : tr("Registry mirrors");
+  if (!c) return `<div class="pane"><h3>${title}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (c.error) return `<div class="pane"><h3>${title}</h3><p class="muted">${tr("Start Kiri to change its registry settings. ({error})", { error: esc(c.error) })}</p></div>`;
+  const draft = ui.regDraft[k];
+  const rows = draft.length
+    ? draft.map((v, i) => `<div class="pref"><span class="t mono">${esc(v)}</span><button class="btn" data-regdel="${k}:${i}">${tr("Remove")}</button></div>`).join("")
+    : `<p class="muted">${k === "insecure" ? tr("None: every registry is checked over HTTPS.") : tr("No mirrors yet: Docker Hub images come from Docker Hub itself.")}</p>`;
+  const changed = JSON.stringify(draft) !== JSON.stringify(c[REG_KEY[k]] || []);
+  const about = k === "insecure"
+    ? tr("Registries reached without a verified certificate (self-signed, or plain HTTP). Kiri tries HTTPS without checking the certificate, then HTTP. Only the hosts and networks listed; every other registry is checked as usual.")
+    : tr("Docker Hub images pull through these in order; the first that has the image answers, and Docker Hub itself is the fallback. Other registries are pulled directly.");
+  const label = k === "insecure" ? tr("Host or network") : tr("Mirror address");
+  const hint = k === "insecure" ? "registry.lan:5000" : "MIRROR_URL";
+  const foot = k === "mirrors" ? `<p class="muted">${tr("Kept in {path} with Docker's names, for docker pull, push, login and build. Docker Desktop's file is left alone.", { path: `<span class="mono">${esc(c.path || "~/.kiri/daemon.json")}</span>` })}</p>${(c.problems || []).map((x) => `<p class="muted" role="alert">${tr("Skipped: {problem}", { problem: esc(x) })}</p>`).join("")}` : "";
+  return `<div class="pane"><h3>${title}</h3>
+    <p class="muted">${about}</p>
+    ${rows}
+    <div class="res-foot" style="margin-top:14px"><input class="field mono" id="reg-${k}" style="flex:1;max-width:420px" aria-label="${label}" value="${esc(ui.regAdd[k])}" placeholder="${hint}" spellcheck="false" autocomplete="off"><button class="btn" data-regadd="${k}">${tr("Add")}</button><span style="flex:1"></span><button class="btn primary" data-regsave="${k}"${changed ? "" : " disabled"}>${tr("Save")}</button></div>
+    ${foot}</div>`;
+}
+function regListAdd(k) {
+  const v = (ui.regAdd[k] || "").trim();
+  if (!v) return;
+  if (!ui.regDraft[k].includes(v)) ui.regDraft[k].push(v);
+  ui.regAdd[k] = "";
+  render();
 }
 /* Settings → Registries: where you're signed in, and signing in to another. */
 function registriesPane() {

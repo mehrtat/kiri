@@ -37,6 +37,12 @@ mod daemon;
 mod diag;
 #[cfg(any(unix, windows))]
 mod docker;
+#[cfg(any(target_os = "macos", all(target_os = "linux", feature = "window"), test))]
+#[cfg_attr(not(any(target_os = "macos", all(target_os = "linux", feature = "window"))), allow(dead_code))]
+mod dockerctx;
+// `kiri domains`: the container-domain routers' ports (Windows: in WSL).
+#[cfg(unix)]
+mod domains_cli;
 mod flavor;
 mod images;
 #[cfg(unix)]
@@ -57,12 +63,17 @@ mod kubeconfig;
 #[cfg(unix)]
 mod machine;
 #[cfg(unix)]
+mod registry_cli;
+#[cfg(unix)]
 mod run;
 #[cfg(unix)]
 mod registry;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod scan;
+// `kiri scan`: vulnerability scanning from the terminal (Windows: in WSL).
+#[cfg(unix)]
+mod scan_cli;
 #[cfg(target_os = "macos")]
 mod setup;
 #[cfg(unix)]
@@ -78,19 +89,23 @@ mod ui;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod tools;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod update;
 
 const USAGE: &str = "\
 usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
                              logs, stop, rm, images, pull, build, compose…
+       kiri start                 start Kiri after a Stop (the window's Start)
        kiri daemon
        kiri bridge [--socket PATH]   (WSL2: the end of kiri-win.exe)
        kiri ui [--start] [--view containers|images|volumes|networks]
        kiri setup [--use] [--no-agent] | kiri setup --uninstall   (Mac)
        kiri setup [all|running|access|docker|builds|skip X|unskip X]   (Linux: the first-run checklist)
        kiri build-with [docker|kiri]   which builder docker build uses
-       kiri update [--check]
+       kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports
+       kiri registry [insecure|mirror] [list | add X... | remove X...]   daemon.json's insecure registries and Docker Hub mirrors
+       kiri scan [--json] [--history] <image>   known vulnerabilities in an image, found by Grype
+       kiri update [--check]      update Kiri (with a container: docker's update)
        kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]
        kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)
        kiri PORT [NAME]           share a local port on the internet (same as kiri share PORT)
@@ -98,6 +113,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri k8s start [--use] | stop | status | delete | set [--lan on|off] [--tls-san NAME,…] [--port N]
        kiri usb [list] | attach DEVICE | detach DEVICE   USB devices for containers, beta (Mac: pass through to the VM)
        kiri registry trust HOST [--ca FILE] [--client-cert F --client-key F] [--yes] | ls | rm HOST   a private registry's CA
+       kiri registry mirror order [--test] | builtin on|off   which Docker Hub mirror is fastest, and the built-in ones
        kiri machine create NAME [--distro D] | list | shell NAME | stop | delete NAME
        kiri import [orbstack | desktop-linux] [--list | [--force] [image|volume|container NAME]]
        kiri bench [--runs N] [--image IMAGE] [--network none|bridge]
@@ -158,10 +174,25 @@ fn main() -> ExitCode {
         // `kiri 3000`: share a port straight away.
         #[cfg(any(unix, windows))]
         Some(a) if share::is_shorthand(a) => share::run(&args),
+        // Bare: the window's Start (`kiri start NAME` is docker's start).
+        #[cfg(unix)]
+        Some("start") if args.len() == 1 => engine_start(),
+        // On Windows, by the `kiri` in WSL, once kiri-start has the daemon up.
+        #[cfg(windows)]
+        Some("start") if args.len() == 1 => wsl::run(&args),
         #[cfg(unix)]
         Some("build-with") => buildwith::cli(&args[1..]),
         #[cfg(unix)]
-        Some("registry") => registry::run(&args[1..]),
+        Some("domains") => domains_cli::run(&args[1..]),
+        #[cfg(unix)]
+        Some("registry") => match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+            // Certificates and the mirror ranking are this fork's own;
+            // daemon.json's insecure registries and mirrors are registry_cli's.
+            (Some("trust" | "ls" | "list" | "rm" | "remove"), _) | (Some("mirror"), Some("order" | "builtin")) => registry::run(&args[1..]),
+            _ => registry_cli::run(&args[1..]),
+        },
+        #[cfg(unix)]
+        Some("scan") => scan_cli::run(&args[1..]),
         #[cfg(unix)]
         Some("k8s") => k8s::run(&args[1..]),
         #[cfg(unix)]
@@ -170,8 +201,8 @@ fn main() -> ExitCode {
         Some("usb") => usb::run(&args[1..]),
         #[cfg(target_os = "macos")]
         Some("import") => import::run(&args[1..]),
-        #[cfg(target_os = "macos")]
-        Some("update") => update::run(&args[1..]),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        Some("update") if !docker::is_container_update(&args[1..]) => update::run(&args[1..]),
         #[cfg(unix)]
         Some("diag") => diag::run(&args[1..]),
         // Opening Kiri.app: set up on first launch, then the window.
@@ -235,6 +266,30 @@ fn window(args: &[String]) -> std::io::Result<()> {
     Err(std::process::Command::new(WINDOW).args(args).exec())
 }
 
+/// `kiri start`: Kiri on again after a Stop (the window's, the tray's or
+/// the menu bar's), as the window's Start does; the containers Stop held
+/// come back. On an engine that wasn't stopped it only wakes the VM.
+#[cfg(unix)]
+fn engine_start() -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if !client::alive() {
+        if let Ok(d) = daemon::state_dir() {
+            let _ = std::fs::remove_file(d.join("stopped"));
+        }
+        update::start_engine()?;
+    }
+    if !client::alive() {
+        return Err(std::io::Error::other("Kiri's engine isn't running. Open Kiri, or start it with `kiri daemon`"));
+    }
+    let r = client::request("POST", "/kiri/wake", None)?;
+    // 404: a Linux host's engine, which has no VM to wake and no Stop.
+    if !r.ok() && r.status != 404 {
+        return Err(std::io::Error::other(r.error()));
+    }
+    println!("Kiri is started");
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn engine_version_check() {}
 
@@ -251,5 +306,16 @@ fn engine_version_check() {
     if engine != me && engine != "0.0.0" {
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kiri".into());
         eprintln!("kiri: this kiri ({exe}) is {me}, but the engine runs {engine}. Restart the engine to use one version (Kiri → Restart engine), or remove the older kiri.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USAGE;
+
+    #[test]
+    fn usage_lists_scan_command() {
+        assert!(USAGE.contains("kiri scan [--json] [--history] <image>"));
+        assert!(!USAGE.ends_with('\n'));
     }
 }

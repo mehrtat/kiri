@@ -34,19 +34,86 @@ pub mod setup {
         Ok(())
     }
 
+    /// Where Kiri's daemon listens on Linux (`KIRI_SOCKET` or `/run/kiri/docker.sock`).
+    pub fn socket_path() -> std::path::PathBuf {
+        std::env::var_os("KIRI_SOCKET").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from(crate::client::SERVICE_SOCKET))
+    }
+
+    /// Who owns `/var/run/docker.sock` on Linux.
+    pub fn docker_sock() -> crate::dockerctx::Endpoint {
+        crate::dockerctx::sock_at(std::path::Path::new("/var/run/docker.sock"), &socket_path(), &[])
+    }
+
+    /// Settings → Network's Docker socket row on Linux (status-only: `kiri.service` links it).
+    pub fn docker_sock_event() -> serde_json::Value {
+        let ours = format!("unix://{}", socket_path().display());
+        crate::dockerctx::sock_event("/var/run/docker.sock", &docker_sock(), &ours, false)
+    }
+
+    /// Unused on Linux (`take` is false), kept to share `ui::Cmd::TakeSocket`.
+    pub fn docker_socket() -> io::Result<()> {
+        Ok(())
+    }
+
     /// The package's service provides /var/run/docker.sock (kiri.service).
     pub fn docker_socket_note() -> Option<String> {
         None
     }
 
-    /// Which engine plain `docker` uses: the CLI's own switch.
-    pub fn use_context(name: &str) -> io::Result<()> {
-        if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) {
-            return Err(io::Error::other("not a context name"));
+    /// Whether `docker` resolves to Kiri's packaged wrapper while no context
+    /// is stored in config.json (`DOCKER_HOST` / `DOCKER_CONTEXT` handled first).
+    fn wrapper_active() -> bool {
+        let Some(docker) = crate::client::docker_cli() else { return false };
+        let Ok(real) = std::fs::canonicalize(docker) else { return false };
+        if real != std::path::Path::new("/usr/libexec/kiri/docker") {
+            return false;
         }
-        let out = std::process::Command::new("docker").args(["context", "use", name]).output()?;
-        if out.status.success() { Ok(()) } else { Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned())) }
+        wrapper_uses_default_config(crate::dockerctx::docker_dir().as_deref())
     }
+
+    fn wrapper_uses_default_config(dir: Option<&std::path::Path>) -> bool {
+        let Some(dir) = dir else { return true };
+        let Ok(bytes) = std::fs::read(dir.join("config.json")) else { return true };
+        let Ok(cfg) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return true };
+        cfg.get("currentContext").and_then(|v| v.as_str()).is_none()
+    }
+
+    /// What plain `docker` uses on Linux, factoring in Kiri's wrapper script.
+    pub fn current_cli(endpoint: &crate::dockerctx::Endpoint) -> crate::dockerctx::Cli {
+        let ours = format!("unix://{}", socket_path().display());
+        let mut cli = crate::dockerctx::current_cli(crate::flavor::CONTEXT.get(), &[&ours], endpoint);
+        if !cli.kiri && cli.context == "default" && cli.pinned.is_none() && wrapper_active() {
+            cli.kiri = true;
+        }
+        cli
+    }
+
+    /// Which engine plain `docker` uses: Kiri's context (created if missing),
+    /// "default", or another existing context, preserving logins and plugins.
+    pub fn use_context(name: &str) -> io::Result<()> {
+        let dir = crate::dockerctx::docker_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
+        let digest = kiri_image::store::sha256_digest(name.as_bytes());
+        let meta = dir.join("contexts/meta").join(digest.trim_start_matches("sha256:"));
+        let host = format!("unix://{}", socket_path().display());
+        crate::dockerctx::switch(&dir, &meta, name, crate::flavor::CONTEXT.get(), crate::flavor::APP.get(), &host)
+    }
+
+    fn config_dir() -> Option<std::path::PathBuf> {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        crate::ui::xdg_config_dir(xdg.as_deref(), home.as_deref())
+    }
+
+    pub fn start_at_login() -> bool {
+        config_dir().is_some_and(|d| crate::ui::linux_autostart_at(&d))
+    }
+
+    pub fn set_start_at_login(on: bool) -> io::Result<()> {
+        let dir = config_dir().ok_or_else(|| io::Error::other("HOME is not set"))?;
+        crate::ui::set_linux_autostart_at(&dir, on)
+    }
+
+    pub fn bootout_agent() {}
 }
 
 pub mod update {
@@ -114,6 +181,10 @@ pub mod update {
     pub fn start_engine() -> io::Result<()> {
         Err(super::engine_down())
     }
+
+    pub fn stop_engine() -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub mod import {
@@ -149,3 +220,18 @@ pub mod import {
 
 /// The checklist, and `kiri setup` for it in a terminal.
 pub(crate) use crate::onboarding;
+
+#[cfg(test)]
+mod tests {
+    use super::setup;
+    use crate::dockerctx::{Endpoint, sock_event};
+
+    #[test]
+    fn linux_sock_event_is_status_only() {
+        let e = sock_event("/var/run/docker.sock", &Endpoint::Free, "unix:///run/kiri/docker.sock", false);
+        assert_eq!((e["owner"].as_str(), e["take"].as_bool()), (Some("free"), Some(false)));
+        let e = sock_event("/var/run/docker.sock", &Endpoint::Taken("/run/podman/podman.sock".into()), "unix:///run/kiri/docker.sock", false);
+        assert_eq!((e["owner"].as_str(), e["engine"].as_str(), e["take"].as_bool()), (Some("other"), Some("Podman"), Some(false)));
+        let _ = setup::docker_socket();
+    }
+}

@@ -771,6 +771,7 @@ dependencies = [
 name = "kiri-image"
 version = "0.0.0"
 dependencies = [
+ "rcgen",
  "rustls",
  "rustls-native-certs",
  "serde",

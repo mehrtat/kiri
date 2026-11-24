@@ -62,6 +62,10 @@ pub struct HostOpts {
     pub rules: Vec<Rule>,
     /// `--group-add`: names (looked up in the container's /etc/group) or ids.
     pub groups: Vec<String>,
+    /// `MaskedPaths` and `ReadonlyPaths` when the API set them; `None` keeps
+    /// the default (Docker's lists, or nothing for a privileged container).
+    pub masked: Option<Vec<CString>>,
+    pub readonly: Option<Vec<CString>>,
 }
 
 fn bad(line: &str) -> io::Error {
@@ -110,6 +114,19 @@ pub fn parse(list: StrList<'_>) -> io::Result<HostOpts> {
             }
             ["devrule", kind, major, minor, perms] => o.rules.push(devices::parse_rule(kind, major, minor, perms).ok_or_else(|| bad(line))?),
             ["group", g] if !g.is_empty() => o.groups.push((*g).to_owned()),
+            [kind @ ("masked" | "readonly"), paths @ ..] => {
+                let paths = paths
+                    .iter()
+                    .map(|p| {
+                        if p.starts_with('/') && !p.split('/').any(|c| c == "..") {
+                            CString::new(*p).map_err(|_| bad(line))
+                        } else {
+                            Err(bad(line))
+                        }
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                *(if *kind == "masked" { &mut o.masked } else { &mut o.readonly }) = Some(paths);
+            }
             _ => return Err(bad(line)),
         }
     }
@@ -240,6 +257,24 @@ fn same_namespace(a: &fs::File, b: &fs::File) -> io::Result<bool> {
     Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
 }
 
+/// The limits the engine's agent sets on itself as it starts, before it
+/// starts anything, so that every container and build step inherits them
+/// (a run's own `--ulimit` still replaces them in the child). In the VM the
+/// agent is PID 1 and has the kernel's defaults; in a WSL distro or a
+/// container it has whatever started it.
+///
+/// No process and no core-size limit, soft or hard: dockerd and containerd
+/// run with `LimitNPROC=infinity` and `LimitCORE=infinity`, so a container
+/// or a BuildKit RUN says unlimited to `ulimit -u` and `ulimit -c`. The
+/// kernel gives PID 1 a process limit from the memory (32142 in an 8 GiB
+/// VM) and a soft core size of 0. The process limit counts a user's
+/// processes in the whole VM, never root's; what holds a fork bomb back is
+/// a container's pids limit (`--pids-limit`), unset by default as with
+/// Docker.
+pub fn agent_rlimits() -> Vec<(u32, u64, u64)> {
+    vec![(libc::RLIMIT_NPROC as u32, u64::MAX, u64::MAX), (libc::RLIMIT_CORE as u32, u64::MAX, u64::MAX)]
+}
+
 /// Sets the resource limits in the child, before it drops capabilities
 /// (raising a hard limit needs CAP_SYS_RESOURCE). runc's error on failure.
 pub fn set_rlimits(rlimits: &[(u32, u64, u64)]) -> io::Result<()> {
@@ -265,16 +300,25 @@ pub fn errno_text(e: &io::Error) -> String {
     c.next().map(|f| f.to_lowercase().chain(c).collect()).unwrap_or(s)
 }
 
-/// The supplementary groups for a user, read from the container's
-/// /etc/passwd and /etc/group as runc does: every group that lists the
-/// user, unless the run named a group (`user:group`), then `--group-add`.
-pub fn supplementary_groups(user: &str, uid: u32, add: &[String]) -> io::Result<Vec<libc::gid_t>> {
+/// The supplementary groups for a user, as Docker gives them: the user's
+/// own group `gid` first, then, read from the container's /etc/passwd and
+/// /etc/group as runc does, every group that lists the user, unless the run
+/// named a group (`user:group`), then `--group-add`.
+pub fn supplementary_groups(user: &str, uid: u32, gid: u32, add: &[String]) -> io::Result<Vec<libc::gid_t>> {
     let group_file = fs::read_to_string("/etc/group").unwrap_or_default();
+    groups_from(&group_file, user, || user_name(uid), gid, add)
+}
+
+/// [`supplementary_groups`] over `group_file`'s text; `uid_name` gives the
+/// name /etc/passwd has for a numeric user.
+fn groups_from(group_file: &str, user: &str, uid_name: impl FnOnce() -> Option<String>, gid: u32, add: &[String]) -> io::Result<Vec<libc::gid_t>> {
     let groups: Vec<Vec<&str>> = group_file.lines().map(|l| l.split(':').collect()).filter(|f: &Vec<&str>| f.len() >= 3).collect();
-    let mut out = Vec::new();
+    // Docker always lists the primary group, so getgroups() includes it
+    // (moby's getUser starts AdditionalGids with the user's gid).
+    let mut out = vec![gid];
     let (name, group) = user.split_once(':').map_or((user, None), |(u, g)| (u, Some(g)));
     if group.is_none() {
-        let name = if name.is_empty() || name.parse::<u32>().is_ok() { user_name(uid) } else { Some(name.to_owned()) };
+        let name = if name.is_empty() || name.parse::<u32>().is_ok() { uid_name() } else { Some(name.to_owned()) };
         if let Some(name) = name {
             for f in &groups {
                 if f.get(3).is_some_and(|members| members.split(',').any(|m| m.trim() == name)) {
@@ -296,6 +340,7 @@ pub fn supplementary_groups(user: &str, uid: u32, add: &[String]) -> io::Result<
         };
         out.push(gid);
     }
+    out.sort_unstable();
     out.dedup();
     Ok(out)
 }
@@ -312,6 +357,35 @@ fn user_name(uid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steps_and_containers_get_no_process_or_core_size_limit_as_with_docker() {
+        // dockerd and containerd run with LimitNPROC=infinity and
+        // LimitCORE=infinity, and a container or a BuildKit RUN inherits
+        // them: `ulimit -u` and `ulimit -c` say unlimited. The kernel gives
+        // PID 1 a process limit from the memory (32142 in an 8 GiB VM) and a
+        // soft core size of 0.
+        const INF: u64 = u64::MAX;
+        assert_eq!(agent_rlimits(), [(libc::RLIMIT_NPROC as u32, INF, INF), (libc::RLIMIT_CORE as u32, INF, INF)]);
+    }
+
+    #[test]
+    fn the_users_own_group_is_a_supplementary_group_as_with_docker() {
+        let group = "root:x:0:root\nwheel:x:10:root,app\napp:x:1000:\nextra:x:2000:\n";
+        let groups = |user: &str, gid: u32, add: &[&str]| {
+            let add: Vec<String> = add.iter().map(|g| g.to_string()).collect();
+            groups_from(group, user, || Some("app".to_owned()), gid, &add).unwrap()
+        };
+        // --user 1000:1000: the named group, nothing from /etc/group.
+        assert_eq!(groups("1000:1000", 1000, &[]), [1000]);
+        // --user app (and its uid alone): its group, then its memberships.
+        assert_eq!(groups("app", 1000, &[]), [10, 1000]);
+        assert_eq!(groups("1000", 1000, &[]), [10, 1000]);
+        // --group-add beside it; a group given twice is listed once.
+        assert_eq!(groups("1000:1000", 1000, &["2000", "app"]), [1000, 2000]);
+        assert_eq!(groups("65534:1234", 1234, &[]), [1234]);
+        assert!(groups_from(group, "1000:1000", || None, 1000, &["nope".to_owned()]).is_err());
+    }
 
     fn list(lines: &[&str]) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -341,6 +415,17 @@ mod tests {
         assert_eq!(o.devices[0].container, "/dev/fuse");
         assert_eq!(o.rules.len(), 1);
         assert_eq!(o.groups, ["video"]);
+        assert!(o.masked.is_none() && o.readonly.is_none());
+        let buf = list(&["masked", "readonly\t/proc/sys\t/data"]);
+        let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+        let o = parse(l).unwrap();
+        assert_eq!(o.masked, Some(vec![]));
+        assert_eq!(o.readonly, Some(vec![c"/proc/sys".to_owned(), c"/data".to_owned()]));
+        for bad_path in ["masked\tproc/kcore", "masked\t/../etc", "readonly\t/proc/../etc"] {
+            let buf = list(&[bad_path]);
+            let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };
+            assert!(parse(l).is_err(), "{bad_path}");
+        }
         for bad in ["sysctl\tnet\tkernel/core_pattern\t|x", "sysctl\tipc\tkernel/../x\t1", "sysctl\tuts\tkernel/hostname\tx", "rlimit\t99\t1\t1", "device\tdev\t/x\trwm", "nope"] {
             let buf = list(&[bad]);
             let kiri_proto::Msg::Retain(l) = kiri_proto::decode(&buf).unwrap() else { panic!() };

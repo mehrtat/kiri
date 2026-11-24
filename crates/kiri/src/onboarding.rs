@@ -167,11 +167,13 @@ pub fn docker_uses_kiri() -> bool {
     }
 }
 
-/// The `kiri` docker context, made if missing, as the current one.
+/// Kiri's docker context (`kiri`, or a development flavor's), made if
+/// missing, as the current one.
 fn use_kiri() -> io::Result<()> {
     let docker = crate::client::docker_cli().ok_or_else(|| io::Error::other("no docker command here: install the kiri package (not kiri-lite) or docker's CLI"))?;
-    let _ = Command::new(&docker).args(["context", "create", "kiri", "--docker", &format!("host=unix://{SOCKET}")]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    let out = Command::new(&docker).args(["context", "use", "kiri"]).output()?;
+    let name = crate::flavor::CONTEXT.get();
+    let _ = Command::new(&docker).args(["context", "create", name, "--docker", &format!("host=unix://{SOCKET}")]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let out = Command::new(&docker).args(["context", "use", name]).output()?;
     if out.status.success() { Ok(()) } else { Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned())) }
 }
 

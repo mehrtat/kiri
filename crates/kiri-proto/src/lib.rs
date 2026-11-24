@@ -25,6 +25,13 @@ pub const MAX_FRAME: usize = 1 << 20;
 /// Bytes before the payload: length plus kind.
 pub const HEADER: usize = 6;
 
+/// Largest frame body a sender may emit so the whole frame stays within
+/// `MAX_FRAME`. A reply built from guest- or container-controlled content (a
+/// directory listing, a `top` table) is capped to this; otherwise one huge
+/// reply overflows `MAX_FRAME`, the peer rejects the frame, and the whole VM
+/// is declared lost and restarted.
+pub const MAX_BODY: usize = MAX_FRAME - HEADER;
+
 /// Largest `Output` chunk; keeps frames well under `MAX_FRAME`.
 pub const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
 /// Stdin bytes the host may have sent a process beyond what the guest has
@@ -41,8 +48,20 @@ pub const INPUT_WINDOW: usize = 4 << 20;
 /// run the container under the default filter instead of its profile. 6
 /// added `Started::starting` and `AwaitStart`: an older host would read a
 /// start still filling a new volume as started, and let an exec in before
-/// the container's root is in place.
-pub const PROTOCOL: u16 = 6;
+/// the container's root is in place. 7 added `CancelStart`, which has no
+/// reply: an older agent's "unexpected" error would be taken as the reply
+/// to the next request. 8 added `DnsRename`, another no-reply message, for
+/// the same reason. 9 added `Limits::swap_max`: an older agent would read
+/// the limits one field short. 10 added a payload on `MemoryPressure`
+/// (MemAvailable and PSI full avg10): an older agent's bare `MemoryPressure`
+/// has neither field, so decode rejects it as truncated. 11 added
+/// `SetEgressRoutes`, another no-reply message (sent on every VM boot): an
+/// older agent's "unexpected" error would be taken as the reply to the next
+/// request.
+pub const PROTOCOL: u16 = 11;
+
+/// Most names a `DnsRename` may carry: a name, its aliases and a hostname.
+pub const MAX_DNS_NAMES: usize = 256;
 
 // `Run` is the one big message and is built and read once per container.
 #[allow(clippy::large_enum_variant)]
@@ -79,6 +98,12 @@ pub enum Msg<'a> {
     /// place now? Answered by `Started` for that container (`starting`
     /// false once it is), or `Error` when it is not running.
     AwaitStart { id: &'a str },
+    /// Host → guest: the container is being stopped or removed while its
+    /// start has not finished. A child still making its root (one that has
+    /// not begun filling a volume) is killed at once, and its start fails;
+    /// one filling a volume is killed as soon as the fill is done. No reply;
+    /// nothing happens to a container whose root is in place.
+    CancelStart { id: &'a str },
     Output { id: &'a str, stream: Stream, data: &'a [u8] },
     Exited(Exited<'a>),
     /// Host → guest: send `signal` to the container's process. No reply;
@@ -111,8 +136,8 @@ pub enum Msg<'a> {
     /// Sent once after connecting. No reply.
     Retain(StrList<'a>),
     /// Host → guest: delete every unpacked layer except these (by blob
-    /// digest), and any left half-written. Sent once after connecting,
-    /// before anything runs. No reply.
+    /// digest), and any left half-written. Sent on connect and after images
+    /// or containers stop referencing layers. No reply.
     RetainLayers(StrList<'a>),
     /// Asks how much disk the guest's layers, containers and volumes use.
     UsageQuery,
@@ -131,9 +156,13 @@ pub enum Msg<'a> {
     /// Host → guest: up to `len` bytes from `offset`. Answered by `FsData` or `Error`.
     FsRead { id: &'a str, path: &'a str, offset: u64, len: u32 },
     FsData(&'a [u8]),
+    /// Host → guest: where a link inside a running container's root points,
+    /// as the link says it. Answered by `FsData` or `Error`.
+    FsReadLink { id: &'a str, path: &'a str },
     /// Guest → host: memory is tight right now (a PSI trigger fired); grow
-    /// the VM's memory. No reply.
-    MemoryPressure,
+    /// the VM's memory, and carry the readings that go with a memory kill.
+    /// No reply.
+    MemoryPressure(MemoryPressure),
     /// Host → guest: delete a named volume's data. No reply.
     RemoveVolume { name: &'a str },
     /// Host → guest, first frame on a connection to [`COPY_PORT`]: copy
@@ -155,7 +184,9 @@ pub enum Msg<'a> {
     ContainerStats(ContainerStats),
     /// Host → guest: the container's processes. Answered by `Top` or `Error`.
     TopQuery { id: &'a str },
-    /// Tab-separated `uid pid ppid c stime tty time cmd`, one process each.
+    /// Tab-separated `user pid ppid c stime tty time comm stat rss vsz %cpu
+    /// %mem etime-secs time-secs uid f priority nice sz cmd`, one process
+    /// each (cmd last; an older agent sent fewer fields before cmd).
     Top(StrList<'a>),
     /// Host → guest: plug a running container into another bridge network
     /// as `ifname`. Answered by `Ack` or `Error`.
@@ -186,6 +217,19 @@ pub enum Msg<'a> {
     /// or `Error` with no lease yet; an older agent answers `Error`.
     UplinkQuery,
     Uplink { ip: [u8; 4], gateway: [u8; 4] },
+    /// Host → guest, in the VM: configure the uplink (`eth0`) directly when
+    /// DHCP did not answer. Ignored (still answered `Ack`) if the guest
+    /// already obtained a DHCP lease. `dns` of `[0; 4]` leaves DNS unset.
+    /// Answered by `Ack` or `Error`; an older agent answers `Error`.
+    SetUplink { ip: [u8; 4], prefix: u8, gateway: [u8; 4], dns: [u8; 4] },
+    /// Host → guest: container `id` on `bridge` was renamed. Its old DNS
+    /// names are dropped and `names` registered to the same address (A
+    /// records only when `v4`: a network without IPv4 addresses keeps the
+    /// address only as the container's key). `ip6` is either empty or 16
+    /// bytes, and `names` has at most `MAX_DNS_NAMES`. No reply, hence the
+    /// protocol bump to 8: an older agent answers an unknown frame with an
+    /// error, which would be read as the next request's reply.
+    DnsRename { id: &'a str, bridge: &'a str, ip: [u8; 4], ip6: &'a [u8], v4: bool, names: StrList<'a> },
     /// Host → guest: a network was removed; delete its bridge, and with it
     /// the bridge's addresses and routes, its DNS server and, with the last
     /// IPv6 network, the IPv6 NAT table. No reply; an older agent ignores it.
@@ -199,6 +243,12 @@ pub enum Msg<'a> {
     /// request; the VM runs inside the daemon process today, so the two
     /// versions cannot differ.
     FsEvents(StrList<'a>),
+    /// Host → guest: IPv4 CIDR prefixes (`a.b.c.d/prefix`) whose outbound
+    /// container TCP connections are redirected to the agent and relayed over
+    /// [`EGRESS_TCP_PORT`] for the host to dial (split-tunnel VPN routes,
+    /// security network extensions, or `0.0.0.0/0` under host egress). Empty
+    /// clears the redirect rules. No reply.
+    SetEgressRoutes(StrList<'a>),
     /// Success, for requests with nothing else to say.
     Ack,
 }
@@ -210,6 +260,11 @@ pub const COPY_PORT: u32 = 1028;
 /// the VM's gateway resolver didn't answer as `u16 len | query`, as DNS over
 /// TCP frames it, and gets `u16 len | reply` back: one lookup per connection.
 pub const DNS_RELAY_PORT: u32 = 1037;
+
+/// vsock port of the host's outbound TCP relay. The agent sends `ip[4] port[2]`
+/// for a connection redirected from a container, and the host dials it and
+/// relays bytes both ways.
+pub const EGRESS_TCP_PORT: u32 = 1038;
 
 /// vsock port of the guest's USB passthrough: one connection per device,
 /// `speed u32 | devid u32` then USB/IP (crates/kiri-init/src/linux/usb.rs).
@@ -231,7 +286,11 @@ pub mod copy_op {
 }
 
 pub mod copy_flags {
-    /// Keep the archive's owners (`docker cp -a`); otherwise root owns everything.
+    /// `docker cp -a` (`copyUIDGID`): chown unpacked entries to the
+    /// container's `Config.User` when one is set (Moby's
+    /// `applyTarCopyUserOptions`), sent as `"<path>\0<user>"` in
+    /// `CopySpec::path`. Without `-a`, or when `Config.User` is empty, the
+    /// archive's header UID/GID are kept.
     pub const KEEP_OWNERS: u32 = 1;
     /// Refuse to replace a directory with a file or the reverse.
     pub const NO_OVERWRITE_DIR_NON_DIR: u32 = 2;
@@ -241,6 +300,9 @@ pub mod copy_flags {
     /// Intel Mac with macOS 14 passes a half-close on as a full one, and the
     /// guest's answer fails with EPIPE.
     pub const CHUNKED: u32 = 4;
+    /// `IN`: the container has `--read-only` (`HostConfig.ReadonlyRootfs`), so
+    /// writes outside writable mounts are refused.
+    pub const READONLY_ROOTFS: u32 = 8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,16 +312,21 @@ pub struct CopySpec<'a> {
     pub path: &'a str,
     pub flags: u32,
     pub layers: StrList<'a>,
+    /// The container's mounts (`source\ttarget\tflags[\t…]`, as in
+    /// [`RunSpec::mounts`]). Empty from an older daemon, and empty for
+    /// `EXPORT`, `DIFF` and `COMMIT`.
+    pub mounts: StrList<'a>,
 }
 
 /// Encodes a `Copy` frame from the sender's side.
-pub fn encode_copy<S: AsRef<str>>(out: &mut Vec<u8>, op: u8, id: &str, path: &str, flags: u32, layers: &[S]) {
+pub fn encode_copy<S: AsRef<str>>(out: &mut Vec<u8>, op: u8, id: &str, path: &str, flags: u32, layers: &[S], mounts: &[S]) {
     frame(out, kind::COPY, |o| {
         o.push(op);
         put_str(o, id);
         put_str(o, path);
         put_u32(o, flags);
         StrList::put(o, layers);
+        StrList::put(o, mounts);
     });
 }
 
@@ -290,10 +357,22 @@ fn put_entry(out: &mut Vec<u8>, e: &FsEntry<'_>) {
 /// Encodes an `FsList` reply from entries.
 pub fn encode_fs_list(out: &mut Vec<u8>, entries: &[FsEntry<'_>]) {
     frame(out, kind::FS_LIST, |o| {
-        put_u32(o, entries.len() as u32);
+        // Cap the reply at MAX_BODY, dropping trailing entries: a directory
+        // with thousands of long names would otherwise overflow MAX_FRAME and
+        // make the peer lose the whole VM.
+        let start = o.len();
+        put_u32(o, 0);
+        let mut n: u32 = 0;
         for e in entries {
+            // Encoded entry: 4+name | mode u32 | size u64 | mtime u64 | nsec u32 | ino u64.
+            let entry_len = 4 + e.name.len() + 4 + 8 + 8 + 4 + 8;
+            if o.len() - start + entry_len > MAX_BODY {
+                break;
+            }
             put_entry(o, e);
+            n += 1;
         }
+        o[start..start + 4].copy_from_slice(&n.to_le_bytes());
     });
 }
 
@@ -342,6 +421,9 @@ pub struct Stats {
     pub mem_stall: u64,
     /// Processes the kernel has killed for memory since boot (/proc/vmstat oom_kill).
     pub oom_kills: u64,
+    /// Pages held by the memory balloon, in KiB. None from an agent or
+    /// kernel that does not report it.
+    pub mem_balloon_kib: Option<u64>,
 }
 
 /// What the guest knows about its own boot, in nanoseconds of CLOCK_BOOTTIME.
@@ -398,6 +480,9 @@ pub mod run_flags {
     /// program as its child, forwards signals to it, reaps orphans and exits
     /// with the program's status, as tini does for Docker.
     pub const INIT: u32 = 1 << 16;
+    /// `--pid host`: no PID namespace of its own; the container sees the
+    /// VM's processes (on a Linux host, the host's).
+    pub const PID_HOST: u32 = 1 << 17;
 }
 
 /// A container's network, as `Run` carries it.
@@ -423,6 +508,9 @@ pub mod net_opts {
     /// `netns=<container id>`: join that running container's network
     /// namespace instead of getting one (`--network container:<id>`).
     pub const NETNS: &str = "netns";
+    /// `pidns=<container id>`: join that running container's PID namespace
+    /// instead of getting one (`--pid container:<id>`).
+    pub const PIDNS: &str = "pidns";
     /// `mac=02:42:ac:11:00:02`: the container side's MAC address.
     pub const MAC: &str = "mac";
     /// `nameserver=1.1.1.1` (`--dns`): with `DNS_GATEWAY` the gateway's DNS
@@ -485,7 +573,8 @@ pub struct RunSpec<'a> {
     pub caps: u64,
     /// HostConfig settings applied at start, one per line, tab-separated:
     /// `rlimit res soft hard`, `sysctl ns path value`, `device host
-    /// container perms`, `devrule type major minor perms`, `group name`.
+    /// container perms`, `devrule type major minor perms`, `group name`,
+    /// `masked path…`, `readonly path…`.
     /// Empty from an older daemon.
     pub opts: StrList<'a>,
     /// The container's own seccomp profile, compiled by the daemon to a
@@ -496,9 +585,10 @@ pub struct RunSpec<'a> {
     pub seccomp: &'a [u8],
 }
 
-/// cgroup limits (`--memory`, `--cpus`, `--cpu-shares`, `--pids-limit`).
-/// Zero means no limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// cgroup limits (`--memory`, `--memory-swap`, `--cpus`, `--cpu-shares`,
+/// `--pids-limit`). Zero means no limit, except `swap_max` where `0` means no
+/// swap and [`NO_LIMIT`] means no limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub memory_max: u64,
     /// CPU time allowed per `cpu_period` microseconds (`--cpus 1.5` is 150000/100000).
@@ -509,6 +599,17 @@ pub struct Limits {
     pub pids_max: u32,
     /// `--shm-size` in bytes; 0 means 64 MiB.
     pub shm_size: u64,
+    /// cgroup v2 `memory.swap.max` in bytes, [`NO_LIMIT`] for `max`.
+    pub swap_max: u64,
+}
+
+/// A limit of `max`.
+pub const NO_LIMIT: u64 = u64::MAX;
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { memory_max: 0, cpu_quota: 0, cpu_period: 0, cpu_weight: 0, pids_max: 0, shm_size: 0, swap_max: NO_LIMIT }
+    }
 }
 
 fn put_limits(out: &mut Vec<u8>, l: &Limits) {
@@ -518,10 +619,19 @@ fn put_limits(out: &mut Vec<u8>, l: &Limits) {
     put_u32(out, l.cpu_weight);
     put_u32(out, l.pids_max);
     put_u64(out, l.shm_size);
+    put_u64(out, l.swap_max);
 }
 
 fn read_limits(r: &mut Reader<'_>) -> Result<Limits, DecodeError> {
-    Ok(Limits { memory_max: r.u64()?, cpu_quota: r.u64()?, cpu_period: r.u32()?, cpu_weight: r.u32()?, pids_max: r.u32()?, shm_size: r.u64()? })
+    Ok(Limits {
+        memory_max: r.u64()?,
+        cpu_quota: r.u64()?,
+        cpu_period: r.u32()?,
+        cpu_weight: r.u32()?,
+        pids_max: r.u32()?,
+        shm_size: r.u64()?,
+        swap_max: r.u64()?,
+    })
 }
 
 /// One container's resource use, read from its cgroup and network namespace.
@@ -547,6 +657,9 @@ pub struct ContainerStats {
     pub tx_packets: u64,
     pub io_read_bytes: u64,
     pub io_write_bytes: u64,
+    pub cpu_periods: u64,
+    pub cpu_throttled_periods: u64,
+    pub cpu_throttled_usec: u64,
 }
 
 fn put_container_stats(o: &mut Vec<u8>, s: &ContainerStats) {
@@ -558,10 +671,13 @@ fn put_container_stats(o: &mut Vec<u8>, s: &ContainerStats) {
     for v in [s.rx_bytes, s.rx_packets, s.tx_bytes, s.tx_packets, s.io_read_bytes, s.io_write_bytes] {
         put_u64(o, v);
     }
+    for v in [s.cpu_periods, s.cpu_throttled_periods, s.cpu_throttled_usec] {
+        put_u64(o, v);
+    }
 }
 
 fn read_container_stats(r: &mut Reader<'_>) -> Result<ContainerStats, DecodeError> {
-    Ok(ContainerStats {
+    let mut stats = ContainerStats {
         read_ns: r.u64()?,
         mem_current: r.u64()?,
         mem_max: r.u64()?,
@@ -578,7 +694,15 @@ fn read_container_stats(r: &mut Reader<'_>) -> Result<ContainerStats, DecodeErro
         tx_packets: r.u64()?,
         io_read_bytes: r.u64()?,
         io_write_bytes: r.u64()?,
-    })
+        ..Default::default()
+    };
+    // Older agents end the message after the block I/O counters.
+    if r.remaining() != 0 {
+        stats.cpu_periods = r.u64()?;
+        stats.cpu_throttled_periods = r.u64()?;
+        stats.cpu_throttled_usec = r.u64()?;
+    }
+    Ok(stats)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,6 +734,16 @@ pub struct Exited<'a> {
     pub run_ns: u64,
     /// The kernel killed a process in the container's cgroup for memory.
     pub oom_killed: bool,
+}
+
+/// What the guest sends with [`Msg::MemoryPressure`]: the readings behind a
+/// memory kill, so the host can log the numbers in the same event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPressure {
+    /// MemAvailable from /proc/meminfo, in KiB.
+    pub mem_available_kib: u64,
+    /// PSI "full avg10" in hundredths of a percent (see `Stats::mem_stall`).
+    pub mem_stall: u64,
 }
 
 /// A list of strings borrowed from a frame. Iterate it; it never allocates.
@@ -646,6 +780,29 @@ impl<'a> StrList<'a> {
         for s in items {
             put_str(out, s.as_ref());
         }
+    }
+
+    /// Like `put`, but keeps the encoded list within `budget` bytes, dropping
+    /// trailing items (and truncating a single over-long item on a char
+    /// boundary) so the frame cannot exceed `MAX_FRAME`. The count written is
+    /// the number actually encoded. Use for replies whose size the sender does
+    /// not control, such as `top` or a directory listing.
+    pub fn put_capped<S: AsRef<str>>(out: &mut Vec<u8>, items: &[S], budget: usize) {
+        let start = out.len();
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut n: u32 = 0;
+        for s in items {
+            // Leave headroom so at least a truncated first item fits: the
+            // 4-byte count already written plus a 4-byte length prefix.
+            let s = s.as_ref();
+            let s = &s[..s.floor_char_boundary(budget.saturating_sub(8))];
+            if out.len() - start + 4 + s.len() > budget {
+                break;
+            }
+            put_str(out, s);
+            n += 1;
+        }
+        out[start..start + 4].copy_from_slice(&n.to_le_bytes());
     }
 }
 
@@ -709,6 +866,11 @@ mod kind {
     pub const USB_NODES: u16 = 77;
     pub const FS_EVENTS: u16 = 78;
     pub const AWAIT_START: u16 = 79;
+    pub const CANCEL_START: u16 = 80;
+    pub const DNS_RENAME: u16 = 81;
+    pub const FS_READ_LINK: u16 = 82;
+    pub const SET_UPLINK: u16 = 83;
+    pub const SET_EGRESS_ROUTES: u16 = 84;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -777,29 +939,53 @@ pub fn encode_net_attach<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, ifname: &st
     });
 }
 
+/// Whether `frame` is of a kind the guest answers with no reply
+/// (`DnsRename`, `SetEgressRoutes`): one that doesn't decode is then dropped,
+/// not answered with an `Error` the host would read as the next request's reply.
+pub fn takes_no_reply(frame: &[u8]) -> bool {
+    frame.len() >= HEADER && matches!(u16::from_le_bytes([frame[4], frame[5]]), kind::DNS_RENAME | kind::SET_EGRESS_ROUTES)
+}
+
+/// Encodes a `SetEgressRoutes` frame from the sender's CIDR strings.
+pub fn encode_set_egress_routes<S: AsRef<str>>(out: &mut Vec<u8>, routes: &[S]) {
+    frame(out, kind::SET_EGRESS_ROUTES, |out| StrList::put_capped(out, routes, MAX_BODY));
+}
+
+/// Encodes a `DnsRename` frame from the sender's slices.
+pub fn encode_dns_rename<S: AsRef<str>>(out: &mut Vec<u8>, id: &str, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, v4: bool, names: &[S]) {
+    frame(out, kind::DNS_RENAME, |o| {
+        put_str(o, id);
+        put_str(o, bridge);
+        o.extend_from_slice(&ip);
+        put_bytes(o, ip6.as_ref().map_or(&[][..], |a| &a[..]));
+        o.push(v4 as u8);
+        StrList::put(o, names);
+    });
+}
+
 /// Encodes a `Usage` reply from the sender's lines.
 pub fn encode_usage<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::USAGE, |out| StrList::put(out, lines));
+    frame(out, kind::USAGE, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes a `Top` reply from the sender's lines.
 pub fn encode_top<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::TOP, |out| StrList::put(out, lines));
+    frame(out, kind::TOP, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes a `UsbNodes` reply from the sender's lines.
 pub fn encode_usb_nodes<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::USB_NODES, |out| StrList::put(out, lines));
+    frame(out, kind::USB_NODES, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes an `FsEvents` frame from the sender's `OP\tPATH` lines.
 pub fn encode_fs_events<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::FS_EVENTS, |out| StrList::put(out, lines));
+    frame(out, kind::FS_EVENTS, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes a `Listening` reply from the sender's lines.
 pub fn encode_listening<S: AsRef<str>>(out: &mut Vec<u8>, lines: &[S]) {
-    frame(out, kind::LISTENING, |out| StrList::put(out, lines));
+    frame(out, kind::LISTENING, |out| StrList::put_capped(out, lines, MAX_BODY));
 }
 
 /// Encodes a `Retain` frame from the sender's ids.
@@ -895,12 +1081,18 @@ impl Msg<'_> {
             Msg::Ping(v) => frame(out, kind::PING, |o| put_u64(o, v)),
             Msg::Pong(v) => frame(out, kind::PONG, |o| put_u64(o, v)),
             Msg::Shutdown => frame(out, kind::SHUTDOWN, |_| {}),
-            Msg::Error(s) => frame(out, kind::ERROR, |o| o.extend_from_slice(s.as_bytes())),
+            Msg::Error(s) => frame(out, kind::ERROR, |o| {
+                let s = &s[..s.floor_char_boundary(MAX_BODY)];
+                o.extend_from_slice(s.as_bytes());
+            }),
             Msg::StatsRequest => frame(out, kind::STATS_REQUEST, |_| {}),
             Msg::Stats(st) => frame(out, kind::STATS, |o| {
                 for v in [st.uptime_ns, st.mem_total_kib, st.mem_available_kib, st.agent_rss_kib, st.mem_used_kib, st.mem_stall, st.oom_kills] {
                     put_u64(o, v);
                 }
+                // Always emit the 8th word (u64::MAX for None) so any future
+                // trailing fields stay at fixed offsets.
+                put_u64(o, st.mem_balloon_kib.unwrap_or(u64::MAX));
             }),
             Msg::LayerQuery(d) => frame(out, kind::LAYER_QUERY, |o| put_str(o, d)),
             Msg::LayerStatus(have) => frame(out, kind::LAYER_STATUS, |o| o.push(have as u8)),
@@ -946,6 +1138,7 @@ impl Msg<'_> {
                 }
             }),
             Msg::AwaitStart { id } => frame(out, kind::AWAIT_START, |o| put_str(o, id)),
+            Msg::CancelStart { id } => frame(out, kind::CANCEL_START, |o| put_str(o, id)),
             Msg::Output { id, stream, data } => frame(out, kind::OUTPUT, |o| {
                 put_str(o, id);
                 o.push(stream as u8);
@@ -1014,9 +1207,25 @@ impl Msg<'_> {
                 put_u32(o, len);
             }),
             Msg::FsData(d) => frame(out, kind::FS_DATA, |o| put_bytes(o, d)),
-            Msg::MemoryPressure => frame(out, kind::MEMORY_PRESSURE, |_| {}),
+            Msg::FsReadLink { id, path } => frame(out, kind::FS_READ_LINK, |o| {
+                put_str(o, id);
+                put_str(o, path);
+            }),
+            Msg::MemoryPressure(p) => frame(out, kind::MEMORY_PRESSURE, |o| {
+                put_u64(o, p.mem_available_kib);
+                put_u64(o, p.mem_stall);
+            }),
             Msg::RemoveVolume { name } => frame(out, kind::REMOVE_VOLUME, |o| put_str(o, name)),
             Msg::RemoveBridge { bridge } => frame(out, kind::REMOVE_BRIDGE, |o| put_str(o, bridge)),
+            Msg::DnsRename { id, bridge, ip, ip6, v4, names } => frame(out, kind::DNS_RENAME, |o| {
+                put_str(o, id);
+                put_str(o, bridge);
+                o.extend_from_slice(&ip);
+                put_bytes(o, ip6);
+                o.push(v4 as u8);
+                put_u32(o, names.count);
+                o.extend_from_slice(names.raw);
+            }),
             Msg::Copy(c) => frame(out, kind::COPY, |o| {
                 o.push(c.op);
                 put_str(o, c.id);
@@ -1024,6 +1233,8 @@ impl Msg<'_> {
                 put_u32(o, c.flags);
                 put_u32(o, c.layers.count);
                 o.extend_from_slice(c.layers.raw);
+                put_u32(o, c.mounts.count);
+                o.extend_from_slice(c.mounts.raw);
             }),
             Msg::CopyStat { entry, link } => frame(out, kind::COPY_STAT, |o| {
                 put_entry(o, &entry);
@@ -1055,6 +1266,10 @@ impl Msg<'_> {
                 put_u32(o, lines.count);
                 o.extend_from_slice(lines.raw);
             }),
+            Msg::SetEgressRoutes(routes) => frame(out, kind::SET_EGRESS_ROUTES, |o| {
+                put_u32(o, routes.count);
+                o.extend_from_slice(routes.raw);
+            }),
             Msg::Listening(lines) => frame(out, kind::LISTENING, |o| {
                 put_u32(o, lines.count);
                 o.extend_from_slice(lines.raw);
@@ -1085,6 +1300,12 @@ impl Msg<'_> {
             Msg::Uplink { ip, gateway } => frame(out, kind::UPLINK, |o| {
                 o.extend_from_slice(&ip);
                 o.extend_from_slice(&gateway);
+            }),
+            Msg::SetUplink { ip, prefix, gateway, dns } => frame(out, kind::SET_UPLINK, |o| {
+                o.extend_from_slice(&ip);
+                o.push(prefix);
+                o.extend_from_slice(&gateway);
+                o.extend_from_slice(&dns);
             }),
             Msg::Ack => frame(out, kind::ACK, |_| {}),
             Msg::InputConsumed { id, bytes } => frame(out, kind::INPUT_CONSUMED, |o| {
@@ -1209,6 +1430,12 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             mem_used_kib: if r.remaining() >= 8 { r.u64()? } else { 0 },
             mem_stall: if r.remaining() >= 8 { r.u64()? } else { 0 },
             oom_kills: if r.remaining() >= 8 { r.u64()? } else { 0 },
+            mem_balloon_kib: if r.remaining() >= 8 {
+                let v = r.u64()?;
+                (v != u64::MAX).then_some(v)
+            } else {
+                None
+            },
         }),
         kind::LAYER_QUERY => Msg::LayerQuery(r.str()?),
         kind::LAYER_STATUS => Msg::LayerStatus(r.u8()? != 0),
@@ -1258,6 +1485,7 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             starting: r.remaining() >= 1 && r.u8()? != 0,
         },
         kind::AWAIT_START => Msg::AwaitStart { id: r.str()? },
+        kind::CANCEL_START => Msg::CancelStart { id: r.str()? },
         kind::OUTPUT => {
             let id = r.str()?;
             let stream = match r.u8()? {
@@ -1298,6 +1526,7 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::FS_STAT_REQUEST => Msg::FsStatRequest { id: r.str()?, path: r.str()? },
         kind::FS_STAT => Msg::FsStat(read_entry(&mut r)?),
         kind::FS_LIST_REQUEST => Msg::FsListRequest { id: r.str()?, path: r.str()? },
+        kind::FS_READ_LINK => Msg::FsReadLink { id: r.str()?, path: r.str()? },
         kind::FS_LIST => {
             let count = r.u32()?;
             let start = r.pos;
@@ -1308,10 +1537,36 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         }
         kind::FS_READ => Msg::FsRead { id: r.str()?, path: r.str()?, offset: r.u64()?, len: r.u32()? },
         kind::FS_DATA => Msg::FsData(r.bytes()?),
-        kind::MEMORY_PRESSURE => Msg::MemoryPressure,
+        kind::MEMORY_PRESSURE => Msg::MemoryPressure(MemoryPressure {
+            mem_available_kib: r.u64()?,
+            mem_stall: r.u64()?,
+        }),
         kind::REMOVE_VOLUME => Msg::RemoveVolume { name: r.str()? },
         kind::REMOVE_BRIDGE => Msg::RemoveBridge { bridge: r.str()? },
-        kind::COPY => Msg::Copy(CopySpec { op: r.u8()?, id: r.str()?, path: r.str()?, flags: r.u32()?, layers: r.list()? }),
+        kind::DNS_RENAME => {
+            let id = r.str()?;
+            let bridge = r.str()?;
+            let ip = r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)?;
+            let ip6 = r.bytes()?;
+            let v4 = r.u8()? != 0;
+            let names = r.list()?;
+            // The address is empty or a whole IPv6 address, and the list is
+            // bounded, so the guest never reads a half address or a frame of
+            // endless names.
+            if !(ip6.is_empty() || ip6.len() == 16) || names.len() > MAX_DNS_NAMES {
+                return Err(DecodeError::Truncated);
+            }
+            Msg::DnsRename { id, bridge, ip, ip6, v4, names }
+        }
+        kind::COPY => Msg::Copy(CopySpec {
+            op: r.u8()?,
+            id: r.str()?,
+            path: r.str()?,
+            flags: r.u32()?,
+            layers: r.list()?,
+            // Trailing list; absent from an older daemon.
+            mounts: if r.remaining() >= 4 { r.list()? } else { StrList::default() },
+        }),
         kind::COPY_STAT => Msg::CopyStat { entry: read_entry(&mut r)?, link: r.str()? },
         kind::COPY_DONE => Msg::CopyDone,
         kind::UPDATE => Msg::Update { id: r.str()?, limits: read_limits(&mut r)? },
@@ -1325,6 +1580,7 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::USB_NODES_QUERY => Msg::UsbNodesQuery,
         kind::USB_NODES => Msg::UsbNodes(r.list()?),
         kind::FS_EVENTS => Msg::FsEvents(r.list()?),
+        kind::SET_EGRESS_ROUTES => Msg::SetEgressRoutes(r.list()?),
         kind::NET_ATTACH => Msg::NetAttach {
             id: r.str()?,
             ifname: r.str()?,
@@ -1347,6 +1603,12 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
         kind::NET_DETACH => Msg::NetDetach { id: r.str()?, ifname: r.str()?, bridge: r.str()?, ip: r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)? },
         kind::UPLINK_QUERY => Msg::UplinkQuery,
         kind::UPLINK => Msg::Uplink { ip: r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)?, gateway: r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)? },
+        kind::SET_UPLINK => Msg::SetUplink {
+            ip: r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)?,
+            prefix: r.u8()?,
+            gateway: r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)?,
+            dns: r.take(4)?.try_into().map_err(|_| DecodeError::Truncated)?,
+        },
         kind::ACK => Msg::Ack,
         kind::INPUT_CONSUMED => Msg::InputConsumed { id: r.str()?, bytes: r.u32()? },
         kind::PUBLISH => Msg::Publish(Publish {
@@ -1374,6 +1636,29 @@ mod tests {
     }
 
     #[test]
+    fn cpu_throttling_stats() {
+        let stats = ContainerStats {
+            cpu_periods: 8,
+            cpu_throttled_periods: 3,
+            cpu_throttled_usec: 1200,
+            ..Default::default()
+        };
+        round(Msg::ContainerStats(stats));
+        // An older agent omits the three trailing throttling words.
+        let mut frame = Vec::new();
+        Msg::ContainerStats(stats).encode(&mut frame);
+        let mut old = frame[..frame.len() - 24].to_vec();
+        let len = (old.len() - 4) as u32;
+        old[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&old).unwrap(), Msg::ContainerStats(ContainerStats::default()));
+        // A truncated trailing section is rejected rather than partially decoded.
+        let mut partial = frame[..frame.len() - 8].to_vec();
+        let len = (partial.len() - 4) as u32;
+        partial[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&partial), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn round_trip() {
         round(Msg::Hello(Hello { protocol: PROTOCOL, init_start_ns: 1, ready_ns: 2, mem_total_kib: 3, mem_available_kib: 4 }));
         round(Msg::Ping(7));
@@ -1381,14 +1666,18 @@ mod tests {
         round(Msg::Shutdown);
         round(Msg::Error("boom"));
         round(Msg::StatsRequest);
-        let full = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 9173, oom_kills: 2 };
+        let full = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 9173, oom_kills: 2, mem_balloon_kib: Some(4096) };
         round(Msg::Stats(full));
+        round(Msg::Stats(Stats { mem_balloon_kib: Some(0), ..full }));
+        round(Msg::Stats(Stats { mem_balloon_kib: None, ..full }));
         // Older agents' Stats, without the later words, still decode.
         let mut buf = Vec::new();
         Msg::Stats(full).encode(&mut buf);
-        let no_memory_words = Stats { mem_stall: 0, oom_kills: 0, ..full };
-        assert_eq!(decode(&buf[..buf.len() - 16]).unwrap(), Msg::Stats(no_memory_words));
-        assert_eq!(decode(&buf[..buf.len() - 24]).unwrap(), Msg::Stats(Stats { mem_used_kib: 0, ..no_memory_words }));
+        let no_balloon = Stats { mem_balloon_kib: None, ..full };
+        assert_eq!(decode(&buf[..buf.len() - 8]).unwrap(), Msg::Stats(no_balloon));
+        let no_memory_words = Stats { mem_stall: 0, oom_kills: 0, ..no_balloon };
+        assert_eq!(decode(&buf[..buf.len() - 24]).unwrap(), Msg::Stats(no_memory_words));
+        assert_eq!(decode(&buf[..buf.len() - 32]).unwrap(), Msg::Stats(Stats { mem_used_kib: 0, ..no_memory_words }));
         round(Msg::LayerQuery("sha256:ab"));
         round(Msg::LayerStatus(true));
         round(Msg::LayerBegin(LayerBegin { digest: "sha256:ab", media_type: "x+gzip", size: 9 }));
@@ -1407,6 +1696,7 @@ mod tests {
         Msg::Started { id: "c1", pid: 42, starting: false }.encode(&mut normal);
         assert_eq!(normal, old, "a normal start's frame is unchanged");
         round(Msg::AwaitStart { id: "c1" });
+        round(Msg::CancelStart { id: "c1" });
         round(Msg::Output { id: "c1", stream: Stream::Stderr, data: b"hi\n" });
         round(Msg::Exited(Exited { id: "c1", code: -1, setup_ns: 3, run_ns: 4, oom_killed: false }));
         round(Msg::Exited(Exited { id: "c1", code: 137, setup_ns: 3, run_ns: 4, oom_killed: true }));
@@ -1426,13 +1716,36 @@ mod tests {
     }
 
     #[test]
+    fn stats_none_balloon_keeps_wire_offset() {
+        let base = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 10, oom_kills: 1, mem_balloon_kib: Some(4096) };
+        let absent = Stats { mem_balloon_kib: None, ..base };
+        let mut with_balloon = Vec::new();
+        let mut without_balloon = Vec::new();
+        Msg::Stats(base).encode(&mut with_balloon);
+        Msg::Stats(absent).encode(&mut without_balloon);
+        assert_eq!(without_balloon.len(), with_balloon.len());
+        // Appending a future 9th word must not be decoded into mem_balloon_kib.
+        let mut extended = without_balloon.clone();
+        extended.extend_from_slice(&42u64.to_le_bytes());
+        let len = (extended.len() - 4) as u32;
+        extended[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&extended).unwrap(), Msg::Stats(absent));
+        // An older 7-word agent omitting the 8th word still decodes as None.
+        let mut old = without_balloon[..without_balloon.len() - 8].to_vec();
+        let len = (old.len() - 4) as u32;
+        old[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&old).unwrap(), Msg::Stats(absent));
+    }
+
+    #[test]
     fn run_spec_lists_survive_encoding() {
         let mut buf = Vec::new();
         let net = Net { bridge: "kiri0", ip: [172, 17, 0, 2], prefix: 16, gateway: [172, 17, 0, 1], extra_hosts: &["1.2.3.4 x"], dns_names: &["web"], opts: &["netns=c0", "nameserver=8.8.8.8"] };
-        let limits = Limits { memory_max: 256 << 20, cpu_quota: 150_000, cpu_period: 100_000, cpu_weight: 100, pids_max: 64, shm_size: 1 << 20 };
+        let limits = Limits { memory_max: 256 << 20, cpu_quota: 150_000, cpu_period: 100_000, cpu_weight: 100, pids_max: 64, shm_size: 1 << 20, swap_max: 512 << 20 };
         encode_run(&mut buf, "c1", &["sha256:top", "sha256:base"], &["echo", "hi"], &["A=1"], "/", "", "c1", 3, net, &["/a\t/b\tro"], &limits, 0b101, &["rlimit\t7\t1024\t2048"], &[]);
         let Msg::Run(r) = decode(&buf).unwrap() else { panic!() };
         assert_eq!(r.id, "c1");
+        assert_eq!(r.limits, limits);
         assert_eq!(r.layers.iter().collect::<Vec<_>>(), ["sha256:top", "sha256:base"]);
         assert_eq!(r.argv.iter().collect::<Vec<_>>(), ["echo", "hi"]);
         assert_eq!(r.env.len(), 1);
@@ -1451,6 +1764,13 @@ mod tests {
     }
 
     #[test]
+    fn the_protocol_version_covers_cancel_start() {
+        // An agent from before `CancelStart` answers it with an error that
+        // the host would take as the reply to its next request.
+        const { assert!(PROTOCOL >= 7) };
+    }
+
+    #[test]
     fn the_protocol_version_covers_starting() {
         // A host from before `Started::starting` would take a start still
         // filling a new volume for started and never ask `AwaitStart`; it
@@ -1460,14 +1780,14 @@ mod tests {
         let mut buf = Vec::new();
         Msg::Hello(Hello { protocol: PROTOCOL, init_start_ns: 1, ready_ns: 2, mem_total_kib: 3, mem_available_kib: 4 }).encode(&mut buf);
         let Msg::Hello(h) = decode(&buf).unwrap() else { panic!() };
-        assert_eq!(h.protocol, 6);
+        assert_eq!(h.protocol, PROTOCOL);
     }
 
     #[test]
     fn the_protocol_version_covers_the_seccomp_field() {
         // An agent from before `RunSpec::seccomp` says 4, and the host refuses
         // it (guest.rs compares the Hello's version with this one).
-        assert!(PROTOCOL >= 5);
+        const { assert!(PROTOCOL >= 5) };
         let mut buf = Vec::new();
         Msg::Hello(Hello { protocol: PROTOCOL, init_start_ns: 1, ready_ns: 2, mem_total_kib: 3, mem_available_kib: 4 }).encode(&mut buf);
         let Msg::Hello(h) = decode(&buf).unwrap() else { panic!() };
@@ -1523,17 +1843,106 @@ mod tests {
     }
 
     #[test]
+    fn dns_rename_survives_encoding() {
+        let mut buf = Vec::new();
+        encode_dns_rename(&mut buf, "c1", "br0", [10, 5, 0, 2], Some([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), false, &["web", "alias"]);
+        let Msg::DnsRename { id, bridge, ip, ip6, v4, names } = decode(&buf).unwrap() else { panic!("not a dns rename") };
+        assert_eq!((id, bridge, ip, v4), ("c1", "br0", [10, 5, 0, 2], false));
+        assert_eq!(ip6.len(), 16);
+        assert_eq!(names.iter().collect::<Vec<_>>(), ["web", "alias"]);
+        let mut again = Vec::new();
+        Msg::DnsRename { id, bridge, ip, ip6, v4, names }.encode(&mut again);
+        assert_eq!(buf, again);
+    }
+
+    #[test]
+    fn dns_rename_with_a_bad_address_or_too_many_names_is_refused() {
+        let mut buf = Vec::new();
+        frame(&mut buf, kind::DNS_RENAME, |o| {
+            put_str(o, "c1");
+            put_str(o, "kiri1");
+            o.extend_from_slice(&[10, 5, 0, 2]);
+            put_bytes(o, &[1, 2, 3]); // neither none nor a whole address
+            o.push(1);
+            StrList::put(o, &["web"]);
+        });
+        assert!(decode(&buf).is_err());
+        let names: Vec<String> = (0..=MAX_DNS_NAMES).map(|i| format!("n{i}")).collect();
+        let mut buf = Vec::new();
+        encode_dns_rename(&mut buf, "c1", "kiri1", [10, 5, 0, 2], None, true, &names);
+        assert!(decode(&buf).is_err());
+        let mut buf = Vec::new();
+        encode_dns_rename(&mut buf, "c1", "kiri1", [10, 5, 0, 2], None, true, &names[..MAX_DNS_NAMES]);
+        assert!(decode(&buf).is_ok());
+    }
+
+    /// A `DnsRename` the guest can't decode is still one it answers with
+    /// nothing; frames that get replies are answered as before.
+    #[test]
+    fn a_bad_dns_rename_is_known_to_take_no_reply() {
+        let names: Vec<String> = (0..=MAX_DNS_NAMES).map(|i| format!("n{i}")).collect();
+        let mut buf = Vec::new();
+        encode_dns_rename(&mut buf, "c1", "kiri1", [10, 5, 0, 2], None, true, &names);
+        assert!(decode(&buf).is_err());
+        assert!(takes_no_reply(&buf));
+        let mut ping = Vec::new();
+        Msg::Ping(1).encode(&mut ping);
+        assert!(!takes_no_reply(&ping));
+        assert!(!takes_no_reply(&buf[..3]));
+    }
+
+    #[test]
+    fn the_protocol_version_covers_dns_rename() {
+        // An agent from before `DnsRename` answers it with an error that the
+        // host would take as the reply to its next request.
+        const { assert!(PROTOCOL >= 8) };
+    }
+
+    #[test]
+    fn the_protocol_version_covers_set_egress_routes() {
+        // An agent from before `SetEgressRoutes` answers it with an error
+        // that the host would take as the reply to its next request.
+        const { assert!(PROTOCOL >= 11) };
+        let mut buf = Vec::new();
+        encode_set_egress_routes(&mut buf, &["10.0.5.0/24"]);
+        assert!(takes_no_reply(&buf));
+    }
+
+    #[test]
+    fn the_protocol_version_covers_swap_max() {
+        // An agent from before `Limits::swap_max` reads the limits one field short.
+        const { assert!(PROTOCOL >= 9) };
+        assert_eq!(Limits::default().swap_max, NO_LIMIT);
+    }
+
+    #[test]
+    fn memory_pressure_payload_survives_encoding_and_covers_protocol() {
+        // An agent from before `MemoryPressure`'s payload sends a bare frame
+        // with neither field; the host rejects it on `Hello`.
+        const { assert!(PROTOCOL >= 10) };
+        round(Msg::MemoryPressure(MemoryPressure { mem_available_kib: 0, mem_stall: 0 }));
+        round(Msg::MemoryPressure(MemoryPressure { mem_available_kib: 524_288, mem_stall: 1234 }));
+        let mut bare = Vec::new();
+        frame(&mut bare, kind::MEMORY_PRESSURE, |_| {});
+        assert_eq!(decode(&bare), Err(DecodeError::Truncated));
+        let mut half = Vec::new();
+        frame(&mut half, kind::MEMORY_PRESSURE, |o| put_u64(o, 4096));
+        assert_eq!(decode(&half), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn fs_messages_survive_encoding() {
         round(Msg::FsStatRequest { id: "c1", path: "/etc" });
         round(Msg::FsStat(FsEntry { name: "etc", mode: 0o40755, size: 4096, mtime: 1_700_000_000, mtime_nsec: 5, ino: 77 }));
         round(Msg::FsRead { id: "c1", path: "/etc/os-release", offset: 10, len: 4096 });
         round(Msg::FsData(b"NAME=Alpine"));
-        round(Msg::MemoryPressure);
+        round(Msg::FsReadLink { id: "c1", path: "/usr/bin/X11" });
+        round(Msg::MemoryPressure(MemoryPressure { mem_available_kib: 1, mem_stall: 2 }));
         round(Msg::RemoveVolume { name: "pgdata" });
         round(Msg::RemoveBridge { bridge: "kiri3" });
         round(Msg::CopyStat { entry: FsEntry { name: "hosts", mode: 0o100644, size: 9, mtime: 3, mtime_nsec: 4, ino: 5 }, link: "" });
         round(Msg::CopyDone);
-        round(Msg::Update { id: "c1", limits: Limits { memory_max: 1, cpu_quota: 2, cpu_period: 3, cpu_weight: 4, pids_max: 5, shm_size: 6 } });
+        round(Msg::Update { id: "c1", limits: Limits { memory_max: 1, cpu_quota: 2, cpu_period: 3, cpu_weight: 4, pids_max: 5, shm_size: 6, swap_max: NO_LIMIT } });
         round(Msg::Freeze { id: "c1", frozen: true });
         round(Msg::StatsQuery { id: "c1" });
         round(Msg::ContainerStats(ContainerStats { read_ns: 1, mem_current: 2, online_cpus: 4, rx_bytes: 9, io_write_bytes: 11, ..Default::default() }));
@@ -1553,6 +1962,11 @@ mod tests {
         encode_fs_events(&mut buf, &["M\t/mnt/mac/Users/a/app/main.js", "D\t/mnt/mac/Users/a/app/old.js"]);
         let Msg::FsEvents(lines) = decode(&buf).unwrap() else { panic!() };
         assert_eq!(lines.iter().collect::<Vec<_>>(), ["M\t/mnt/mac/Users/a/app/main.js", "D\t/mnt/mac/Users/a/app/old.js"]);
+        let mut buf = Vec::new();
+        encode_set_egress_routes(&mut buf, &["10.0.5.0/24", "198.18.0.0/15"]);
+        let Msg::SetEgressRoutes(routes) = decode(&buf).unwrap() else { panic!() };
+        assert_eq!(routes.iter().collect::<Vec<_>>(), ["10.0.5.0/24", "198.18.0.0/15"]);
+        assert!(takes_no_reply(&buf));
         let mut buf = Vec::new();
         encode_listening(&mut buf, &["   0: 00000000:11D7 00000000:0000 0A"]);
         let Msg::Listening(lines) = decode(&buf).unwrap() else { panic!() };
@@ -1576,15 +1990,28 @@ mod tests {
         round(Msg::Route { dst: [10, 43, 0, 0], prefix: 16, via: [172, 17, 0, 4], add: true });
         round(Msg::UplinkQuery);
         round(Msg::Uplink { ip: [192, 168, 64, 18], gateway: [192, 168, 64, 1] });
+        round(Msg::SetUplink { ip: [192, 168, 64, 2], prefix: 24, gateway: [192, 168, 64, 1], dns: [192, 168, 64, 1] });
+        round(Msg::SetUplink { ip: [10, 0, 0, 5], prefix: 16, gateway: [10, 0, 0, 1], dns: [0, 0, 0, 0] });
         round(Msg::Ack);
         let mut buf = Vec::new();
-        encode_copy(&mut buf, copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS, &["sha256:a", "sha256:b"]);
+        let mounts = ["/var/lib/kiri/volumes/pg/_data\t/var/lib/postgresql/data\tcreate,copyup", "/host/cfg\t/etc/app\tro"];
+        encode_copy(&mut buf, copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS | copy_flags::READONLY_ROOTFS, &["sha256:a", "sha256:b"], &mounts);
         let Msg::Copy(c) = decode(&buf).unwrap() else { panic!() };
-        assert_eq!((c.op, c.id, c.path, c.flags), (copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS));
+        assert_eq!((c.op, c.id, c.path, c.flags), (copy_op::IN, "c1", "/etc", copy_flags::KEEP_OWNERS | copy_flags::READONLY_ROOTFS));
         assert_eq!(c.layers.iter().collect::<Vec<_>>(), ["sha256:a", "sha256:b"]);
+        assert_eq!(c.mounts.iter().collect::<Vec<_>>(), mounts);
         let mut again = Vec::new();
         Msg::Copy(c).encode(&mut again);
         assert_eq!(buf, again);
+        // An older daemon's Copy frame without the mount list still decodes.
+        let mut old = Vec::new();
+        encode_copy(&mut old, copy_op::OUT, "c1", "/etc", 0, &["sha256:a"], &[]);
+        old.truncate(old.len() - 4);
+        let len = (old.len() - 4) as u32;
+        old[..4].copy_from_slice(&len.to_le_bytes());
+        let Msg::Copy(old_c) = decode(&old).unwrap() else { panic!() };
+        assert_eq!(old_c.layers.iter().collect::<Vec<_>>(), ["sha256:a"]);
+        assert!(old_c.mounts.is_empty());
         let mut buf = Vec::new();
         let entries = [
             FsEntry { name: "a", mode: 0o100644, size: 1, mtime: 2, mtime_nsec: 9, ino: 1 },
@@ -1606,5 +2033,188 @@ mod tests {
         Msg::LayerQuery("sha256:ab").encode(&mut buf);
         buf.truncate(buf.len() - 1);
         assert_eq!(decode(&buf), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn oversized_replies_stay_within_max_frame() {
+        // A single `top` line far larger than MAX_FRAME (a container process
+        // with a huge cmdline): the frame must stay decodable, not overflow.
+        let huge = "x".repeat(MAX_FRAME * 2);
+        let mut buf = Vec::new();
+        encode_top(&mut buf, core::slice::from_ref(&huge));
+        assert!(buf.len() <= MAX_FRAME, "top frame {} > MAX_FRAME", buf.len());
+        assert!(frame_len(&buf[..4].try_into().unwrap()).is_ok());
+        let Msg::Top(lines) = decode(&buf).unwrap() else { panic!() };
+        let got: Vec<_> = lines.iter().collect();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].len() < huge.len()); // truncated to fit
+
+        // Many long lines: trailing ones are dropped, the frame still fits.
+        let many: Vec<String> = (0..5000).map(|_| "y".repeat(500)).collect();
+        buf.clear();
+        encode_top(&mut buf, &many);
+        assert!(buf.len() <= MAX_FRAME);
+        let Msg::Top(lines) = decode(&buf).unwrap() else { panic!() };
+        let kept = lines.iter().count();
+        assert!(kept > 0 && kept < many.len());
+
+        // Same for a directory listing with thousands of max-length names.
+        let names: Vec<String> = (0..5000).map(|_| "n".repeat(255)).collect();
+        let entries: Vec<FsEntry<'_>> = names
+            .iter()
+            .map(|n| FsEntry { name: n, mode: 0o100644, size: 0, mtime: 0, mtime_nsec: 0, ino: 1 })
+            .collect();
+        buf.clear();
+        encode_fs_list(&mut buf, &entries);
+        assert!(buf.len() <= MAX_FRAME, "fs_list frame {} > MAX_FRAME", buf.len());
+        let Msg::FsList { count, raw } = decode(&buf).unwrap() else { panic!() };
+        let kept = fs_entries(count, raw).count();
+        assert!(kept > 0 && kept < entries.len());
+    }
+
+    #[test]
+    fn capped_str_list_replies_fit_at_exact_boundary_and_utf8() {
+        type ListEnc = fn(&mut Vec<u8>, &[String]);
+        let encoders: &[(&str, ListEnc)] = &[
+            ("top", encode_top::<String>),
+            ("usage", encode_usage::<String>),
+            ("usb_nodes", encode_usb_nodes::<String>),
+            ("fs_events", encode_fs_events::<String>),
+            ("set_egress_routes", encode_set_egress_routes::<String>),
+            ("listening", encode_listening::<String>),
+        ];
+        // Exact single-item fit (MAX_BODY - 8 bytes) and 1 byte over.
+        let exact = "a".repeat(MAX_BODY - 8);
+        let over = "a".repeat(MAX_BODY - 7);
+        for &(name, enc) in encoders {
+            let mut buf = Vec::new();
+            enc(&mut buf, core::slice::from_ref(&exact));
+            assert_eq!(buf.len(), MAX_FRAME, "{name}: exact fit should hit MAX_FRAME");
+            assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(buf.len()), "{name}: exact frame_len");
+            assert!(decode(&buf).is_ok(), "{name}: exact decode");
+
+            buf.clear();
+            enc(&mut buf, core::slice::from_ref(&over));
+            assert_eq!(buf.len(), MAX_FRAME, "{name}: 1-byte-over should cap to MAX_FRAME");
+            assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(buf.len()), "{name}: over frame_len");
+            assert!(decode(&buf).is_ok(), "{name}: over decode");
+
+            // 1.5 MiB of 2-byte (`é`) and 4-byte (`🦀`) UTF-8 at every alignment 0..4.
+            for ch in ["é", "🦀"] {
+                for pad in 0..4 {
+                    let mut huge = "p".repeat(pad);
+                    let reps = (MAX_FRAME + MAX_FRAME / 2) / ch.len();
+                    for _ in 0..reps {
+                        huge.push_str(ch);
+                    }
+                    buf.clear();
+                    enc(&mut buf, &[huge]);
+                    assert!(buf.len() <= MAX_FRAME, "{name} {ch} pad={pad}: {} > MAX_FRAME", buf.len());
+                    assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(buf.len()));
+                    assert!(decode(&buf).is_ok(), "{name} {ch} pad={pad}: decode failed");
+                }
+            }
+
+            // 20,000 entries crossing MAX_FRAME, also when appending after existing bytes in buf.
+            let many: Vec<String> = (0..20_000).map(|i| format!("line-{i:05}-{}", "z".repeat(80))).collect();
+            buf.clear();
+            buf.extend_from_slice(b"prefix");
+            enc(&mut buf, &many);
+            let frame = &buf[6..];
+            assert!(frame.len() <= MAX_FRAME, "{name}: many frame {} > MAX_FRAME", frame.len());
+            assert_eq!(frame_len(&frame[..4].try_into().unwrap()), Ok(frame.len()));
+            assert!(decode(frame).is_ok(), "{name}: many decode failed");
+        }
+
+        // Short first item followed by an oversized second item: keeps the first
+        // and drops the second cleanly without exceeding MAX_FRAME.
+        let mut buf = Vec::new();
+        encode_top(&mut buf, &["first".to_owned(), "x".repeat(MAX_FRAME * 2), "third".to_owned()]);
+        assert!(buf.len() <= MAX_FRAME);
+        assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(buf.len()));
+        let Msg::Top(lines) = decode(&buf).unwrap() else { panic!() };
+        assert_eq!(lines.iter().collect::<Vec<_>>(), ["first"]);
+    }
+
+    #[test]
+    fn fs_list_stays_within_max_frame_at_boundary_and_utf8() {
+        // Each encoded entry takes 36 + name.len() bytes; body starts with 4-byte count.
+        // Pick an entry name length that lands right on MAX_BODY:
+        // MAX_BODY = 1_048_570; 4 + 10_485 * 100 (64-byte names) = 1_048_504,
+        // leaving 66 bytes -> a 30-byte name fills 36 + 30 = 66 bytes to hit
+        // MAX_BODY (and MAX_FRAME) to the exact byte.
+        let mut names: Vec<String> = (0..10_485).map(|i| format!("{i:064}")).collect();
+        names.push("b".repeat(30));
+        names.push("overflow".to_owned());
+        let entries: Vec<FsEntry<'_>> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| FsEntry { name: n, mode: 0o100644, size: i as u64, mtime: 1, mtime_nsec: 2, ino: i as u64 })
+            .collect();
+        let mut buf = Vec::new();
+        encode_fs_list(&mut buf, &entries);
+        assert_eq!(buf.len(), MAX_FRAME, "exact boundary entries should hit MAX_FRAME");
+        assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(MAX_FRAME));
+        let Msg::FsList { count, raw } = decode(&buf).unwrap() else { panic!() };
+        assert_eq!(count as usize, 10_486);
+        let decoded: Vec<_> = fs_entries(count, raw).collect();
+        assert_eq!(decoded, entries[..10_486]);
+
+        // 20,000 entries with max-length multi-byte UTF-8 names.
+        let utf8_name = "🦀".repeat(63); // 252 bytes (<= NAME_MAX 255)
+        let utf8_entries: Vec<FsEntry<'_>> = (0..20_000)
+            .map(|i| FsEntry { name: &utf8_name, mode: 0o100644, size: i as u64, mtime: 0, mtime_nsec: 0, ino: i as u64 })
+            .collect();
+        buf.clear();
+        encode_fs_list(&mut buf, &utf8_entries);
+        assert!(buf.len() <= MAX_FRAME, "utf8 fs_list {} > MAX_FRAME", buf.len());
+        assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(buf.len()));
+        let Msg::FsList { count, raw } = decode(&buf).unwrap() else { panic!() };
+        let kept = fs_entries(count, raw).count();
+        assert!(kept > 0 && kept < utf8_entries.len());
+
+        // Single impossibly huge entry (> MAX_BODY): encodes 0 entries, still decodable.
+        let giant = "g".repeat(MAX_FRAME);
+        buf.clear();
+        encode_fs_list(&mut buf, &[FsEntry { name: &giant, mode: 0o100644, size: 0, mtime: 0, mtime_nsec: 0, ino: 1 }]);
+        assert!(buf.len() <= MAX_FRAME);
+        assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(buf.len()));
+        let Msg::FsList { count, raw } = decode(&buf).unwrap() else { panic!() };
+        assert_eq!(count, 0);
+        assert_eq!(fs_entries(count, raw).count(), 0);
+    }
+
+    #[test]
+    fn oversized_error_stays_within_max_frame_and_valid_utf8() {
+        let mut buf = Vec::new();
+        let exact = "e".repeat(MAX_BODY);
+        Msg::Error(&exact).encode(&mut buf);
+        assert_eq!(buf.len(), MAX_FRAME);
+        assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(MAX_FRAME));
+        assert_eq!(decode(&buf).unwrap(), Msg::Error(&exact));
+
+        let over = "e".repeat(MAX_BODY + 1);
+        buf.clear();
+        Msg::Error(&over).encode(&mut buf);
+        assert_eq!(buf.len(), MAX_FRAME);
+        assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(MAX_FRAME));
+        assert_eq!(decode(&buf).unwrap(), Msg::Error(&exact));
+
+        for ch in ["é", "🦀"] {
+            for pad in 0..4 {
+                let mut huge = "p".repeat(pad);
+                let reps = (MAX_FRAME + MAX_FRAME / 2) / ch.len();
+                for _ in 0..reps {
+                    huge.push_str(ch);
+                }
+                buf.clear();
+                Msg::Error(&huge).encode(&mut buf);
+                assert!(buf.len() <= MAX_FRAME, "error {ch} pad={pad}: {} > MAX_FRAME", buf.len());
+                assert_eq!(frame_len(&buf[..4].try_into().unwrap()), Ok(buf.len()));
+                let Msg::Error(got) = decode(&buf).unwrap() else { panic!() };
+                assert!(huge.starts_with(got));
+                assert!(got.len() <= MAX_BODY && got.len() >= MAX_BODY - 3);
+            }
+        }
     }
 }
