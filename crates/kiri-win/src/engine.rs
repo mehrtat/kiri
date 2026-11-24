@@ -122,6 +122,7 @@ pub fn start(e: Env) {
     let (tx, rx) = mpsc::channel();
     *TX.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx.clone());
     let _ = std::thread::Builder::new().name("kiri-engine".into()).spawn(move || engine(&rx, tx));
+    let _ = std::thread::Builder::new().name("kiri-host-disk".into()).spawn(watch_host_disk);
 }
 
 /// Delivers one JSON event to the page. Callable from any thread.
@@ -338,13 +339,27 @@ fn start_daemon() -> io::Result<()> {
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
     // Each killed after WSL_LIMIT: a wsl.exe right after Windows wakes can hang.
     let started = crate::update::output_within(cmd.args(["-u", "root", "--", "systemctl", "start", "kiri"]), crate::update::WSL_LIMIT);
-    if !started.is_ok_and(|o| o.status.success()) {
-        let mut cmd = crate::win::tool("wsl.exe");
-        if let Some(d) = &distro {
-            cmd.args(["-d", d]);
+    // What wsl.exe said, for why the engine did not start (wsldisk.rs).
+    let mut said = String::new();
+    let mut heard = |o: &std::process::Output| {
+        said.push_str(&crate::setup::wsl_text(&o.stdout));
+        said.push_str(&crate::setup::wsl_text(&o.stderr));
+    };
+    match &started {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            if let Ok(o) = &started {
+                heard(o);
+            }
+            let mut cmd = crate::win::tool("wsl.exe");
+            if let Some(d) = &distro {
+                cmd.args(["-d", d]);
+            }
+            std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+            if let Ok(o) = crate::update::output_within(cmd.args(["-u", "root", "--", "/usr/local/bin/kiri-start"]), crate::update::WSL_LIMIT) {
+                heard(&o);
+            }
         }
-        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-        let _ = crate::update::output_within(cmd.args(["-u", "root", "--", "/usr/local/bin/kiri-start"]), crate::update::WSL_LIMIT);
     }
     for _ in 0..100 {
         if client::alive() {
@@ -352,7 +367,33 @@ fn start_daemon() -> io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(io::Error::other("Kiri's engine did not start in WSL: run contrib\\windows\\kiri.ps1 to install it"))
+    let name = distro.unwrap_or_else(|| crate::setup::KIRI_DISTRO.to_owned());
+    let drive = crate::win::distro_dir(&name).and_then(|p| crate::win::free_bytes(&p));
+    if !said.trim().is_empty() {
+        crate::serve::log(&format!("engine: WSL said: {}", said.trim()));
+    }
+    Err(io::Error::other(crate::wsldisk::not_started(&said, &name, drive.as_ref().map(|(d, f)| (d.as_str(), *f)))))
+}
+
+/// Every 30 s: the room on the drive that holds the distro's disk, to the
+/// daemon, which starts no new work below its floor (daemon/hostdisk.rs),
+/// and to the window once each time it runs low.
+fn watch_host_disk() {
+    let mut warned = false;
+    loop {
+        let name = distro().unwrap_or_else(|| crate::setup::KIRI_DISTRO.to_owned());
+        if let Some((drive, free)) = crate::win::distro_dir(&name).and_then(|p| crate::win::free_bytes(&p)) {
+            let _ = client::request_within("PUT", "/kiri/hostdisk", Some(&json!({"drive": drive, "free": free})), true, Some(Duration::from_secs(5)));
+            let low = free < crate::wsldisk::LOW_FREE;
+            if low && !warned {
+                let text = crate::wsldisk::low_notice(&drive, free);
+                crate::serve::log(&format!("engine: {text}"));
+                emit(notice("error", &text));
+            }
+            warned = low;
+        }
+        std::thread::sleep(Duration::from_secs(30));
+    }
 }
 
 /// `docker build` through Kiri, as on the Mac: BuildKit in a Kiri container
