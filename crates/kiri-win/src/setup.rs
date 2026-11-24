@@ -157,9 +157,15 @@ pub(crate) fn reimport_kiri_linux(base: &Path) -> io::Result<()> {
     wsl_ok(quiet("wsl.exe").args(["--import", KIRI_DISTRO]).arg(base).arg(&tar).args(["--version", "2"]))
 }
 
-/// The folder Kiri Linux is imported into when WSL does not say where it was.
+/// The folder Kiri Linux is imported into: on the internal drive with the
+/// most room (wsldisk::roomiest), else in %LOCALAPPDATA%\Kiri\wsl.
 pub(crate) fn kiri_linux_dir() -> PathBuf {
-    dir().join("wsl").join(KIRI_DISTRO)
+    let local = dir();
+    let root = local.components().next().map(|c| format!("{}\\", c.as_os_str().to_string_lossy())).unwrap_or_default();
+    match crate::wsldisk::roomiest(&root, &crate::win::fixed_drives()) {
+        Some(base) => PathBuf::from(base).join(KIRI_DISTRO),
+        None => local.join("wsl").join(KIRI_DISTRO),
+    }
 }
 
 /// The distro setup put Kiri in, for the bridge.
@@ -782,8 +788,10 @@ fn install_linux(kind: &str) -> io::Result<()> {
         task(0, "done", &format!("{} MB", std::fs::metadata(&tar)?.len().div_ceil(1_000_000)));
         task(1, "active", "");
         if !distros().unwrap_or_default().iter().any(|d| d == KIRI_DISTRO) {
-            log_line(&format!("wsl --import {KIRI_DISTRO} {} kiri-linux.tar.gz --version 2", base.join(KIRI_DISTRO).display()));
-            wsl_ok(quiet("wsl.exe").args(["--import", KIRI_DISTRO]).arg(base.join(KIRI_DISTRO)).arg(&tar).args(["--version", "2"]))?;
+            let place = kiri_linux_dir();
+            std::fs::create_dir_all(&place)?;
+            log_line(&format!("wsl --import {KIRI_DISTRO} {} kiri-linux.tar.gz --version 2", place.display()));
+            wsl_ok(quiet("wsl.exe").args(["--import", KIRI_DISTRO]).arg(&place).arg(&tar).args(["--version", "2"]))?;
         }
         task(1, "done", "");
         task(2, "active", "");
