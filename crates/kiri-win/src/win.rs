@@ -303,3 +303,74 @@ pub fn free_bytes(path: &Path) -> Option<(String, u64)> {
     let root = path.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
     Some((root, free))
 }
+
+/// The drives Kiri Linux's disk may go on, each root (`D:\`) with its free
+/// bytes: fixed and NTFS or ReFS (what WSL keeps a disk on), and not on USB
+/// or an SD card, which Windows also calls fixed when it is a disk drive
+/// and which can be unplugged. Never a network or removable drive.
+pub fn fixed_drives() -> Vec<(String, u64)> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
+    /// GetDriveTypeW's DRIVE_FIXED.
+    const FIXED: u32 = 3;
+    // SAFETY: no arguments; a bit per drive letter.
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u8 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i) as char;
+        let root = format!("{letter}:\\");
+        let wroot: Vec<u16> = root.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a NUL-terminated root path.
+        if unsafe { GetDriveTypeW(wroot.as_ptr()) } != FIXED {
+            continue;
+        }
+        let mut fs = [0u16; 32];
+        // SAFETY: the root, and a buffer of fs.len() units for the file system's name; the rest not asked for.
+        let named = unsafe { GetVolumeInformationW(wroot.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), fs.as_mut_ptr(), fs.len() as u32) };
+        let fs = String::from_utf16_lossy(&fs[..fs.iter().position(|&c| c == 0).unwrap_or(fs.len())]);
+        if named == 0 || !matches!(fs.as_str(), "NTFS" | "ReFS") || unpluggable(letter) {
+            continue;
+        }
+        if let Some((_, free)) = free_bytes(Path::new(&root)) {
+            out.push((root, free));
+        }
+    }
+    out
+}
+
+/// Whether the drive is on USB, an SD card or MMC; also when that cannot be
+/// read, so only a drive known to be internal is used.
+fn unpluggable(letter: char) -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{BusTypeMmc, BusTypeSd, BusTypeUsb, CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{PropertyStandardQuery, StorageDeviceProperty, IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY};
+    let path: Vec<u16> = format!("\\\\.\\{letter}:").encode_utf16().chain(Some(0)).collect();
+    // SAFETY: opening the volume with no access rights, only to ask about it.
+    let h = unsafe { CreateFileW(path.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, 0) };
+    if h == INVALID_HANDLE_VALUE {
+        return true;
+    }
+    let query = STORAGE_PROPERTY_QUERY { PropertyId: StorageDeviceProperty, QueryType: PropertyStandardQuery, AdditionalParameters: [0] };
+    // SAFETY: plain data; all-zero is valid before the call fills it.
+    let mut d: STORAGE_DEVICE_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let mut got = 0u32;
+    // SAFETY: the handle opened above, the query and a descriptor of the sizes given.
+    let ok = unsafe {
+        DeviceIoControl(
+            h,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&query as *const STORAGE_PROPERTY_QUERY).cast(),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            (&mut d as *mut STORAGE_DEVICE_DESCRIPTOR).cast(),
+            std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() as u32,
+            &mut got,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: the handle opened above, closed once.
+    unsafe { CloseHandle(h) };
+    ok == 0 || matches!(d.BusType, BusTypeUsb | BusTypeSd | BusTypeMmc)
+}
